@@ -166,10 +166,55 @@ func (c *Client) connectOnce() error {
 	}
 
 	dialer := &net.Dialer{Timeout: c.opts.DialTimeout}
+	writeTimeout := c.opts.writeTimeout()
 	cfg := amqp091.Config{
 		TLSClientConfig: c.opts.TLSConfig,
 		Heartbeat:       c.opts.Heartbeat,
-		Dial:            dialer.Dial,
+		// Wrap the raw connection with a rolling write deadline (see
+		// deadlineConn and the WriteTimeout field doc) so a stuck Publish,
+		// Ack/Nack/Reject, or heartbeat write fails within writeTimeout
+		// instead of hanging forever and poisoning pubChMu/subChMu.
+		Dial: func(network, addr string) (net.Conn, error) {
+			conn, err := dialer.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// Bound the handshake itself (TLS, if any, then SASL/tune/open).
+			// amqp091-go's own DefaultDial does this (see its comment: "A
+			// deadline is set for TLS and AMQP handshaking. After AMQP is
+			// established, the deadline is cleared in openComplete") — but
+			// DefaultDial only runs when Config.Dial is left nil, and we
+			// supply our own Dial here, so that protection is silently
+			// skipped unless we set it ourselves. Without it, a broker that
+			// accepts the TCP connection but never completes the handshake
+			// hangs Connect() forever: the heartbeater that later owns the
+			// read deadline is not running yet during the handshake, and
+			// nothing else bounds it either. This matters beyond the initial
+			// Connect() call — startReconnect's retry loop calls
+			// connectOnce() synchronously on every attempt, so a hung
+			// handshake here would wedge reconnection itself on its very
+			// first try, defeating the WriteTimeout fix above (which
+			// depends on that loop actually running to recover from a
+			// torn-down connection). openComplete (called by amqp091-go
+			// internally right after a successful open) clears this same
+			// deadline through the SetDeadline method promoted from the
+			// embedded net.Conn below, handing steady-state read management
+			// back to the heartbeater exactly as DefaultDial would.
+			//
+			// DialTimeout <= 0 means "no dial timeout" (matching
+			// net.Dialer's own zero-means-unbounded convention, used above
+			// for the TCP dial itself) — SetDeadline(now+0) would instead
+			// mean "already expired", failing every handshake immediately,
+			// so skip it in that case rather than silently breaking that
+			// convention for callers who set DialTimeout=0 on purpose.
+			if c.opts.DialTimeout > 0 {
+				if err := conn.SetDeadline(time.Now().Add(c.opts.DialTimeout)); err != nil {
+					_ = conn.Close()
+					return nil, err
+				}
+			}
+			return &deadlineConn{Conn: conn, writeTimeout: writeTimeout}, nil
+		},
 	}
 	if c.opts.ConnectionName != "" {
 		cfg.Properties = amqp091.Table{

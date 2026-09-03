@@ -17,6 +17,11 @@ const (
 	DefaultHeartbeat        = 60 * time.Second
 	DefaultReconnectBackoff = 1 * time.Second
 	DefaultMaxReconnectWait = 2 * time.Minute
+
+	// DefaultWriteTimeout is used when WriteTimeout is left at its zero value
+	// and Heartbeat is also zero (heartbeats disabled), so writes still get a
+	// bounded deadline. See the WriteTimeout field doc.
+	DefaultWriteTimeout = 60 * time.Second
 )
 
 // Options configures the AMQP 0.9.1 client.
@@ -31,6 +36,38 @@ type Options struct {
 	TLSConfig      *tls.Config // TLS configuration (nil for plain TCP)
 	DialTimeout    time.Duration
 	Heartbeat      time.Duration
+
+	// WriteTimeout bounds every individual Write on the connection's
+	// underlying net.Conn with a rolling deadline, reset before each call
+	// (see deadlineConn in deadline_conn.go). amqp091-go deliberately leaves
+	// writes unbounded after the initial handshake — see openComplete's
+	// comment "RabbitMQ uses TCP flow control at this point for pushback so
+	// Writes can intentionally block" — which is reasonable for ordinary
+	// backpressure (resolves in seconds) but means a write that is not
+	// merely slow but genuinely stuck (broker/cluster hiccup, a half-open
+	// connection, a silent network partition) blocks forever with no bound
+	// at all. That single stuck write — inside Publish, inside
+	// Ack/Nack/Reject, or inside amqp091-go's own heartbeat frame writer,
+	// they all end up here — then holds whatever higher-level lock called it
+	// (pubChMu/subChMu) for good, and every later call on the same Client
+	// blocks on that lock too, all while the connection looks "open": no
+	// error, no OnConnectionLost, no reconnect, until whatever OS-level TCP
+	// timeout eventually fires (observed: multiple hours in production).
+	// WriteTimeout turns that indefinite hang into a bounded I/O error,
+	// which surfaces through amqp091-go's NotifyClose and lets the existing
+	// OnConnectionLost/AutoReconnect path (see handleDisconnect,
+	// startReconnect) do its job promptly instead.
+	//
+	// This intentionally does NOT touch the read deadline: amqp091-go
+	// already manages that itself (Connection.heartbeater resets it to 3x
+	// the negotiated heartbeat interval on every frame received), and
+	// overriding it here would just fight a mechanism that already works.
+	//
+	// Zero means "derive from Heartbeat": 2*Heartbeat, generous enough to
+	// never trip during ordinary backpressure while still being far shorter
+	// than any reasonable OS-level TCP timeout, or DefaultWriteTimeout if
+	// Heartbeat is also 0 (heartbeats disabled).
+	WriteTimeout time.Duration
 
 	// Channel QoS
 	PrefetchCount int // Maximum unacked deliveries
@@ -112,6 +149,26 @@ func (o *Options) SetDialTimeout(d time.Duration) *Options {
 func (o *Options) SetHeartbeat(d time.Duration) *Options {
 	o.Heartbeat = d
 	return o
+}
+
+// SetWriteTimeout sets the per-Write deadline on the connection. See the
+// WriteTimeout field doc for what this protects against and how the zero
+// value is derived from Heartbeat.
+func (o *Options) SetWriteTimeout(d time.Duration) *Options {
+	o.WriteTimeout = d
+	return o
+}
+
+// writeTimeout returns the effective per-Write deadline: WriteTimeout if
+// set, otherwise 2*Heartbeat, otherwise DefaultWriteTimeout.
+func (o *Options) writeTimeout() time.Duration {
+	if o.WriteTimeout > 0 {
+		return o.WriteTimeout
+	}
+	if o.Heartbeat > 0 {
+		return 2 * o.Heartbeat
+	}
+	return DefaultWriteTimeout
 }
 
 // SetPrefetch sets channel prefetch limits.
