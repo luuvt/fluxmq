@@ -6,12 +6,48 @@ package amqp
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestOptionsSetURL(t *testing.T) {
 	opts := NewOptions().SetURL("amqp://user:pass@localhost:5672/vhost")
 	if opts.URL != "amqp://user:pass@localhost:5672/vhost" {
 		t.Fatalf("expected URL to be set, got %q", opts.URL)
+	}
+}
+
+func TestOptionsWriteTimeout(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*Options)
+		want      time.Duration
+	}{
+		{
+			name:      "explicit WriteTimeout wins over Heartbeat",
+			configure: func(o *Options) { o.Heartbeat = 5 * time.Second; o.WriteTimeout = 3 * time.Second },
+			want:      3 * time.Second,
+		},
+		{
+			name:      "derives 2x Heartbeat when WriteTimeout unset",
+			configure: func(o *Options) { o.Heartbeat = 45 * time.Second },
+			want:      90 * time.Second,
+		},
+		{
+			name:      "falls back to DefaultWriteTimeout when both unset",
+			configure: func(o *Options) { o.Heartbeat = 0 },
+			want:      DefaultWriteTimeout,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewOptions()
+			opts.Heartbeat = 0 // NewOptions sets DefaultHeartbeat; start from a clean slate
+			tc.configure(opts)
+			if got := opts.writeTimeout(); got != tc.want {
+				t.Fatalf("writeTimeout() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
