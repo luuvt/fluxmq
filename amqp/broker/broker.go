@@ -445,6 +445,16 @@ func (b *Broker) Close() error {
 	b.connections.Range(func(key, val any) bool {
 		c := val.(*Connection)
 		c.close()
+		// close() alone only cancels the connection's context and closes
+		// closeCh -- processFrames only polls those between frames and
+		// spends nearly all its time blocked in a real network read, which
+		// neither one interrupts. Closing the socket too (the same pairing
+		// disconnect() already uses) is what actually unblocks that read,
+		// lets run()'s deferred cleanup() run, and releases the
+		// connection's cluster-side session ownership and subscriptions
+		// instead of leaking them for the rest of etcd's life (see
+		// TestBrokerCloseUnblocksIdleConnectionForCleanup).
+		_ = c.conn.Close()
 		return true
 	})
 	b.logger.Info("AMQP 0.9.1 broker shut down")
