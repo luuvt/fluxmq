@@ -478,6 +478,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.wg.Add(1)
 	go m.runCleanupLoop() //nolint:contextcheck // goroutine manages its own context lifecycle
 
+	// Start connection-liveness heartbeat touch -- see runHeartbeatTouchLoop's
+	// doc comment for why cleanupStaleConsumers alone needs this companion.
+	m.wg.Add(1)
+	go m.runHeartbeatTouchLoop() //nolint:contextcheck // goroutine manages its own context lifecycle
+
 	// Start retention
 	m.wg.Add(1)
 	go m.runRetentionLoop() //nolint:contextcheck // goroutine manages its own context lifecycle
@@ -1881,20 +1886,10 @@ func (m *Manager) cleanupStaleConsumers() {
 	}
 
 	for _, queueConfig := range queues {
-		// A replicated queue's consumer-group state (LastHeartbeat included)
-		// is only authoritative on its Raft leader: raftGroupStore.GetConsumerGroup
-		// -- what CleanupStaleConsumers below reads through -- serves this
-		// node's own LOCAL store, unlike every mutating group-store method,
-		// which goes through applyOrForward (Raft consensus). A follower's
-		// local view can legitimately lag behind the leader's for a
-		// currently-alive consumer (ordinary Raft log-apply delay, not
-		// corruption), which used to make a follower wrongly decide a live
-		// consumer was stale from its own stale read and forward a removal
-		// for it -- see TestCleanupStaleConsumers_FollowerMustNotEvictFromLocalStaleRead.
-		// Same guard runRetentionLoop's truncation already uses for the
-		// identical reason ("queue %q truncation must run on its raft
-		// leader"); skipping here just means the leader's own cleanup pass
-		// runs the eviction and it replicates to this node normally.
+		// A follower's local consumer-group view can lag the leader's
+		// (GetConsumerGroup reads local state, unlike mutating methods
+		// which go through Raft), so only the leader may decide staleness
+		// here -- same guard runRetentionLoop's truncation already uses.
 		if queueConfig.Replication.Enabled && m.coordinator() != nil && !m.coordinator().IsLeaderForQueue(queueConfig.Name) {
 			continue
 		}
@@ -1913,6 +1908,57 @@ func (m *Manager) cleanupStaleConsumers() {
 					slog.String("group", group.ID))
 				m.handleConsumersRemoved(ctx, queueConfig.Name, group.ID, removed)
 			}
+		}
+	}
+}
+
+// runHeartbeatTouchLoop is cleanupStaleConsumers' companion: that function
+// only sees a fresh LastHeartbeat as a side effect of a delivery pass
+// running, and delivery is purely event-driven (new appends or
+// subscribe/unsubscribe, see delivery_schedule.go) -- a low-traffic group
+// can go quiet longer than ConsumerTimeout with no delivery pass at all, so
+// a perfectly healthy consumer gets evicted for nothing. This loop touches
+// LastHeartbeat instead from actual connection state (see
+// touchLiveLocalConsumers), on config.HeartbeatInterval (default 10s, well
+// under ConsumerTimeout's 2m). Runs on every node unconditionally: this is
+// a plain heartbeat write, which already routes correctly through
+// applyOrForward for replicated queues or stays local otherwise, same as
+// any other RegisterConsumer call today.
+func (m *Manager) runHeartbeatTouchLoop() {
+	defer m.wg.Done()
+
+	interval := m.config.HeartbeatInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.touchLiveConsumerHeartbeats()
+		}
+	}
+}
+
+func (m *Manager) touchLiveConsumerHeartbeats() {
+	ctx := context.Background()
+
+	queues, err := m.queueStore.ListQueues(ctx)
+	if err != nil {
+		return
+	}
+
+	for _, queueConfig := range queues {
+		groups, err := m.groupStore.ListConsumerGroups(ctx, queueConfig.Name)
+		if err != nil {
+			continue
+		}
+		for _, group := range groups {
+			m.delivery.touchLiveLocalConsumers(ctx, queueConfig.Name, group)
 		}
 	}
 }

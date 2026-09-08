@@ -484,6 +484,46 @@ func (e *DeliveryEngine) localDeliveryTargetMissing(clientID string) bool {
 	return ok && !checker.IsClientConnected(clientID)
 }
 
+// localDeliveryTargetConfirmedPresent is localDeliveryTargetMissing's
+// opposite-direction counterpart: touchLiveLocalConsumers must be CERTAIN
+// the client is still there before extending its heartbeat, so an
+// unverifiable target defaults to false here, the reverse of
+// localDeliveryTargetMissing's own safe default.
+func (e *DeliveryEngine) localDeliveryTargetConfirmedPresent(clientID string) bool {
+	if targetChecker, ok := e.local.(ClientDeliveryTargetChecker); ok {
+		return targetChecker.HasDeliveryTarget(clientID)
+	}
+	if checker, ok := e.local.(ClientConnectionChecker); ok {
+		return checker.IsClientConnected(clientID)
+	}
+	return false
+}
+
+// touchLiveLocalConsumers refreshes LastHeartbeat for every LOCAL consumer in
+// group whose client connection is confirmed alive right now -- see
+// runHeartbeatTouchLoop (manager.go). A remote-proxied consumer is left for
+// its owning node, the only one that can actually confirm it.
+func (e *DeliveryEngine) touchLiveLocalConsumers(ctx context.Context, queueName string, group *types.ConsumerGroup) {
+	// ForEachConsumer holds group's RLock for the callback; TouchConsumer
+	// needs the same mutex's exclusive Lock, so touching inline here would
+	// self-deadlock (RWMutex isn't reentrant). Collect IDs first, touch
+	// after the read lock is released.
+	var toTouch []string
+	group.ForEachConsumer(func(id string, info *types.ConsumerInfo) bool {
+		if e.isRemoteConsumer(info) {
+			return true
+		}
+		if e.local == nil || !e.localDeliveryTargetConfirmedPresent(info.ClientID) {
+			return true
+		}
+		toTouch = append(toTouch, id)
+		return true
+	})
+	for _, id := range toTouch {
+		e.touchConsumerHeartbeat(ctx, queueName, group.ID, id)
+	}
+}
+
 func (e *DeliveryEngine) unregisterConsumer(ctx context.Context, queueName, groupID, consumerID string, reason error) {
 	attrs := []slog.Attr{
 		slog.String("queue", queueName),
