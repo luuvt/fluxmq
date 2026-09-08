@@ -1881,6 +1881,24 @@ func (m *Manager) cleanupStaleConsumers() {
 	}
 
 	for _, queueConfig := range queues {
+		// A replicated queue's consumer-group state (LastHeartbeat included)
+		// is only authoritative on its Raft leader: raftGroupStore.GetConsumerGroup
+		// -- what CleanupStaleConsumers below reads through -- serves this
+		// node's own LOCAL store, unlike every mutating group-store method,
+		// which goes through applyOrForward (Raft consensus). A follower's
+		// local view can legitimately lag behind the leader's for a
+		// currently-alive consumer (ordinary Raft log-apply delay, not
+		// corruption), which used to make a follower wrongly decide a live
+		// consumer was stale from its own stale read and forward a removal
+		// for it -- see TestCleanupStaleConsumers_FollowerMustNotEvictFromLocalStaleRead.
+		// Same guard runRetentionLoop's truncation already uses for the
+		// identical reason ("queue %q truncation must run on its raft
+		// leader"); skipping here just means the leader's own cleanup pass
+		// runs the eviction and it replicates to this node normally.
+		if queueConfig.Replication.Enabled && m.coordinator() != nil && !m.coordinator().IsLeaderForQueue(queueConfig.Name) {
+			continue
+		}
+
 		groups, err := m.groupStore.ListConsumerGroups(ctx, queueConfig.Name)
 		if err != nil {
 			continue
