@@ -464,6 +464,13 @@ func (c *EtcdCluster) Start() error {
 		c.logger.Warn("failed to load session owner cache", slog.String("error", err.Error()))
 	}
 
+	// Prune subscriptions orphaned before this fix existed (see
+	// pruneOrphanedSubscriptions' doc comment) once at startup, not just on
+	// reconcileSessionOwnerCache's 5-minute tick below -- otherwise a node
+	// that just picked up this fix would still spend up to 5 more minutes
+	// dropping messages for backlog it could clean up immediately.
+	c.pruneOrphanedSubscriptions()
+
 	// Load existing queue consumers into cache
 	if err := c.loadQueueConsumerCache(); err != nil {
 		c.logger.Warn("failed to load queue consumer cache", slog.String("error", err.Error()))
