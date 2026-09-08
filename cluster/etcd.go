@@ -2744,7 +2744,65 @@ func (c *EtcdCluster) reconcileSessionOwnerCache() {
 					slog.String("error", err.Error()))
 			}
 			c.selfHealLeasedKeys()
+			c.pruneOrphanedSubscriptions()
 		}
+	}
+}
+
+// pruneOrphanedSubscriptions removes every subscription entry whose client
+// has no live session owner in etcd. AddSubscription's entries carry no
+// lease (unlike AcquireSession's owner key), so the ONLY other cleanup path
+// -- removeOrphanedClusterSubscriptions (mqtt/broker/session.go) -- is lazy:
+// it fires only the next time the exact same client ID reconnects. AMQP
+// 0.9.1 client IDs are "<remote-addr>@<sequence>" (Broker.nextConnectionID,
+// a monotonic per-process counter) and are never reused, so that lazy path
+// can never reach them -- an ungraceful disconnect (or, before this fork's
+// Broker.Close() fix, any graceful broker restart) orphans the entry
+// permanently. RoutePublish then logs "skipped subscribers with unknown
+// session owner" for it on every single matching publish, forever, since
+// nothing else ever removes it.
+//
+// A subscription with no owner key is unambiguously orphaned, not a race
+// with a session that hasn't registered yet: a client can only reach
+// AddSubscription after CONNECT's registerAndValidate has already called
+// AcquireSession (see amqp/broker/connection.go's run()), so the owner key
+// is always written strictly before any subscription for that client can
+// exist.
+func (c *EtcdCluster) pruneOrphanedSubscriptions() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := c.client.Get(ctx, subscriptionsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		c.logger.Warn("pruneOrphanedSubscriptions: list subscriptions failed", slog.String("error", err.Error()))
+		return
+	}
+
+	pruned := 0
+	for _, kv := range resp.Kvs {
+		clientID := strings.TrimPrefix(string(kv.Key), subscriptionsPrefix)
+		if clientID == "" {
+			continue
+		}
+		owner, ok, err := c.GetSessionOwner(ctx, clientID)
+		if err != nil {
+			c.logger.Warn("pruneOrphanedSubscriptions: GetSessionOwner failed",
+				slog.String("client_id", clientID), slog.String("error", err.Error()))
+			continue
+		}
+		if ok && owner != "" {
+			continue
+		}
+		if err := c.RemoveAllSubscriptions(ctx, clientID); err != nil {
+			c.logger.Warn("pruneOrphanedSubscriptions: remove failed",
+				slog.String("client_id", clientID), slog.String("error", err.Error()))
+			continue
+		}
+		pruned++
+	}
+	if pruned > 0 {
+		c.logger.Info("pruneOrphanedSubscriptions: removed stale subscriptions with no live session owner",
+			slog.Int("count", pruned))
 	}
 }
 
