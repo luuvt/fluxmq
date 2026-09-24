@@ -381,6 +381,12 @@ func NewManager(queueStore storage.QueueStore, groupStore storage.ConsumerGroupS
 		logger,
 	)
 	engine.setConsumerRemovedCallback(mgr.handleConsumersRemoved)
+	// Resolved per call: the Raft coordinator is attached after construction
+	// (SetRaftCoordinator) and leadership moves at runtime.
+	engine.setReplicatedFollowerCheck(func(queueName string) bool {
+		c := mgr.coordinator()
+		return c != nil && !c.IsLeaderForQueue(queueName)
+	})
 
 	// The facade takes ownership of what it aggregates. The core above is
 	// already complete and is not touched again.

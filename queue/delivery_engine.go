@@ -46,6 +46,9 @@ type DeliveryEngine struct {
 	batchSize         int
 	logger            *slog.Logger
 	onConsumerRemoved func(context.Context, string, string, []string)
+	// replicatedFollower reports whether this node is a follower (not the
+	// Raft leader) of the named replicated queue. nil means single-node.
+	replicatedFollower func(queueName string) bool
 
 	schedule *deliveryQueue
 
@@ -86,6 +89,10 @@ func NewDeliveryEngine(
 
 func (e *DeliveryEngine) setConsumerRemovedCallback(callback func(context.Context, string, string, []string)) {
 	e.onConsumerRemoved = callback
+}
+
+func (e *DeliveryEngine) setReplicatedFollowerCheck(check func(queueName string) bool) {
+	e.replicatedFollower = check
 }
 
 // Start launches the delivery loop goroutine.
@@ -174,6 +181,22 @@ func (e *DeliveryEngine) run(ctx context.Context) {
 
 func (e *DeliveryEngine) deliverQueueConfig(ctx context.Context, queueConfig *types.QueueConfig) bool {
 	if queueConfig == nil {
+		return false
+	}
+
+	// A replicated queue's consumer-group state is only authoritative on its
+	// Raft leader: claims read the group through raftGroupStore.GetConsumerGroup,
+	// which serves this node's LOCAL store, while every mutation the claim makes
+	// (AddPending, UpdateCursor, ...) is forwarded to the leader. A follower's
+	// local view can lag the leader's (ordinary Raft log-apply delay), so a
+	// follower claiming from it re-delivers records the leader has already
+	// handed out -- even acked -- and forwards a stale UpdateCursor that the
+	// leader's store applies as-is, moving the group's cursor backwards. Only
+	// the leader delivers; it routes to consumers connected to other nodes
+	// through the remote router, same as any remote consumer. See
+	// TestReplicatedManualStream_FollowerMustNotDeliverFromLaggingView. Same
+	// leader-only guard as cleanupStaleConsumers and runRetentionLoop.
+	if queueConfig.Replication.Enabled && e.replicatedFollower != nil && e.replicatedFollower(queueConfig.Name) {
 		return false
 	}
 

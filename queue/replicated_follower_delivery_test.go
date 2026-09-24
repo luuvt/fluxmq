@@ -1,0 +1,164 @@
+// Copyright (c) Abstract Machines
+// SPDX-License-Identifier: Apache-2.0
+
+package queue
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"testing"
+
+	"github.com/absmach/fluxmq/message"
+	clusterv1 "github.com/absmach/fluxmq/pkg/proto/cluster/v1"
+	memlog "github.com/absmach/fluxmq/queue/storage/memory/log"
+	"github.com/absmach/fluxmq/queue/types"
+)
+
+// allOpsForwarder records every group mutation a follower forwards to the
+// leader (recordingGroupForwarder keeps only the last one).
+type allOpsForwarder struct {
+	mu  sync.Mutex
+	ops []string
+}
+
+func (f *allOpsForwarder) ForwardGroupOp(_ context.Context, _, _ string, op *clusterv1.GroupOperation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Heartbeat touch (RegisterConsumer) is expected from any node; only
+	// delivery-state mutations matter here.
+	if _, heartbeat := op.GetOperation().(*clusterv1.GroupOperation_RegisterConsumer); heartbeat {
+		return nil
+	}
+	f.ops = append(f.ops, fmt.Sprintf("%T", op.GetOperation()))
+	return nil
+}
+
+func (f *allOpsForwarder) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+// newReplicatedManualStreamNode builds one broker node's queue manager for a
+// replicated stream queue with a manual-commit group and one locally
+// connected consumer. isLeader selects whether this node leads the queue.
+// Two records (offsets 0 and 1) are already in the (replicated) log.
+//
+// The group state seeded into this node's local store is deliberately the
+// state the LEADER held two records ago: cursor 0, nothing pending. On a
+// follower that is exactly what ordinary Raft apply lag looks like after the
+// leader has delivered offsets 0 and 1 and the consumer has acked both.
+func newReplicatedManualStreamNode(t *testing.T, isLeader bool, consumerNode string) (*Manager, *allOpsForwarder, func() []uint64) {
+	t.Helper()
+	const queueName = "replication"
+	const groupID = "channels@aiot_cloud/group/+"
+	const consumerID = "consumer-1"
+
+	logStore := memlog.New()
+	groupStore := newMockGroupStore()
+
+	var mu sync.Mutex
+	var delivered []uint64
+	deliverer := DeliveryTargetFunc(func(_ context.Context, _ string, msg *message.Envelope) error {
+		mu.Lock()
+		defer mu.Unlock()
+		delivered = append(delivered, msg.BrokerMeta.Queue.Offset)
+		return nil
+	})
+
+	config := DefaultConfig()
+	config.WritePolicy = WritePolicyForward
+	manager := NewManager(logStore, groupStore, deliverer, config,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	ctx := context.Background()
+
+	coordinator := &mockQueueCoordinator{
+		enabled:           true,
+		replicatedByQueue: map[string]bool{queueName: true},
+		leaderByQueue:     map[string]bool{queueName: isLeader},
+		leaderIDByQueue:   map[string]string{queueName: "node-leader"},
+	}
+	forwarder := new(allOpsForwarder)
+	manager.SetRaftCoordinator(coordinator)
+	manager.raftGroupStore.SetForwarder(forwarder)
+
+	queueCfg := types.DefaultQueueConfig(queueName, "$queue/"+queueName+"/#")
+	queueCfg.Type = types.QueueTypeStream
+	queueCfg.Replication.Enabled = true
+	if err := logStore.CreateQueue(ctx, queueCfg); err != nil {
+		t.Fatalf("CreateQueue failed: %v", err)
+	}
+	for _, id := range []string{"update-name-A", "update-name-B"} {
+		env := newQueueEnvelope(id, "$queue/"+queueName+"/aiot_cloud/group/update", []byte(id))
+		if _, err := logStore.Append(ctx, queueName, env); err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+	}
+
+	group := types.NewConsumerGroupState(queueName, groupID, "aiot_cloud/group/+")
+	group.Mode = types.GroupModeStream
+	group.SetAutoCommit(false)
+	group.SetConsumer(consumerID, &types.ConsumerInfo{ID: consumerID, ClientID: consumerID, ProxyNodeID: consumerNode})
+	if err := groupStore.CreateConsumerGroup(ctx, group); err != nil {
+		t.Fatalf("CreateConsumerGroup failed: %v", err)
+	}
+
+	return manager, forwarder, func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]uint64(nil), delivered...)
+	}
+}
+
+// Control: the leader's own view is authoritative, so delivering from it is
+// correct.
+func TestReplicatedManualStream_LeaderDeliversFromItsView(t *testing.T) {
+	manager, _, delivered := newReplicatedManualStreamNode(t, true, "")
+	manager.delivery.DeliverQueue(context.Background(), "replication")
+
+	got := delivered()
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("leader: expected exactly offset 0 delivered, got %v", got)
+	}
+}
+
+// A follower's local group view lags the leader (reads are local, writes are
+// forwarded -- see raftGroupStore). If the follower's delivery engine claims
+// from that view, it hands the consumer a record the leader has already
+// delivered and the consumer has already acked -- a stale redelivery that
+// arrives AFTER newer records (offset 1 here), i.e. out of order.
+func TestReplicatedManualStream_FollowerMustNotDeliverFromLaggingView(t *testing.T) {
+	manager, forwarder, delivered := newReplicatedManualStreamNode(t, false, "")
+	manager.delivery.DeliverQueue(context.Background(), "replication")
+
+	if got := delivered(); len(got) > 0 {
+		t.Errorf("BUG: follower delivered offsets %v from its lagging local view of a replicated queue "+
+			"(leader already delivered+acked 0 and 1 in this scenario) -> duplicate and out-of-order redelivery", got)
+	}
+	if ops := forwarder.recorded(); len(ops) > 0 {
+		t.Errorf("BUG: follower forwarded group mutations to the leader based on its stale view: %v", ops)
+	}
+}
+
+// The leader-only guard must not starve consumers connected to a follower:
+// the leader routes their records to that node like any remote consumer.
+func TestReplicatedManualStream_LeaderRoutesToConsumerOnFollower(t *testing.T) {
+	manager, _, delivered := newReplicatedManualStreamNode(t, true, "node-follower")
+	remote := &mockRemoteRouter{}
+	manager.delivery.remote = remote
+	manager.delivery.localNodeID = "node-leader"
+
+	manager.delivery.DeliverQueue(context.Background(), "replication")
+
+	if got := delivered(); len(got) != 0 {
+		t.Fatalf("leader delivered locally %v to a consumer that lives on node-follower", got)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if len(remote.routed) != 1 || remote.routed[0].nodeID != "node-follower" || remote.routed[0].msg.BrokerMeta.Queue.Offset != 0 {
+		t.Fatalf("expected offset 0 routed to node-follower, got %+v", remote.routed)
+	}
+}
