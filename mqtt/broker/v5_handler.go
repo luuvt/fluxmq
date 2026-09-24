@@ -161,6 +161,9 @@ func (h *v5Handler) HandleConnect(ctx context.Context, conn core.Connection, pkt
 		if errors.Is(err, ErrMaxSessionsExceeded) {
 			connAckCode = v5.ConnAckQuotaExceeded
 		}
+		// An unspecified error tells the client nothing, so the reason has to
+		// be on this side or the refusal cannot be diagnosed at all.
+		h.broker.logError("v5_create_session_failed", err, slog.String("client_id", clientID))
 		sendV5ConnAck(conn, false, connAckCode, nil) //nolint:errcheck // best-effort rejection reply before closing
 		conn.Close()
 		return err
@@ -173,10 +176,10 @@ func (h *v5Handler) HandleConnect(ctx context.Context, conn core.Connection, pkt
 	// a configuration reload cannot leave the connection enforcing a limit other
 	// than the one its CONNACK announced.
 	sessionMaxQoS := h.broker.MaxQoS()
-	var expiryInterval *uint32
-	if !isNew {
-		expiryInterval = &sessionExpiry
-	}
+	// The interval this CONNECT carried, passed for every CONNECT: attachSession
+	// applies it to a session that is being continued and leaves a new one with
+	// what createSession settled on.
+	expiryInterval := &sessionExpiry
 	epoch, err := h.broker.attachSession(ctx, s, claim, conn, session.ConnectOptions{
 		Version:        p.ProtocolVersion,
 		KeepAlive:      time.Duration(p.KeepAlive) * time.Second,
@@ -700,14 +703,58 @@ func (h *v5Handler) HandlePingReq(s *connCtx) error {
 
 // HandleDisconnect handles DISCONNECT packets.
 func (h *v5Handler) HandleDisconnect(s *connCtx, pkt packets.ControlPacket) error {
-	_, ok := pkt.(*v5.Disconnect)
+	p, ok := pkt.(*v5.Disconnect)
 	if !ok {
 		return ErrInvalidPacketType
 	}
 
-	h.broker.telemetry.logger.Info("v5_disconnect", slog.String("client_id", s.ID))
-	s.Disconnect(true, v5.DisconnectNormalDisconnection) //nolint:errcheck // graceful disconnect initiated by client
+	reasonCode := byte(v5.DisconnectNormalDisconnection)
+	logAttrs := []any{slog.String("client_id", s.ID)}
+	if p.Properties != nil && p.Properties.SessionExpiryInterval != nil {
+		expiry := *p.Properties.SessionExpiryInterval
+		switch {
+		case expiry == 0:
+			// A zero Session Expiry Interval ends the session when the network
+			// connection closes, regardless of Clean Start. [MQTT-3.1.2-23]
+			s.SetExpiryInterval(0)
+		case s.ConnectExpiryInterval() == 0:
+			// A non-zero Session Expiry Interval after a CONNECT whose expiry was
+			// 0 is a Protocol Error [MQTT-3.14.2.2.2]: the override is refused
+			// with 0x82 and the session still ends on the interval the client
+			// asked for. The CONNECT-time value is what decides this, because a
+			// persistent session may be carrying the server's default expiry
+			// rather than the zero the client sent.
+			h.broker.telemetry.stats.IncrementProtocolErrors()
+			s.SetExpiryInterval(0)
+			reasonCode = v5.DisconnectProtocolError
+		default:
+			s.SetExpiryInterval(expiry)
+		}
+		logAttrs = append(logAttrs, slog.Uint64("session_expiry", uint64(s.Info().ExpiryInterval)))
+	}
+
+	h.broker.telemetry.logger.Info("v5_disconnect", logAttrs...)
+
+	s.DisconnectWithCause(disconnectCause(p.ReasonCode, reasonCode), reasonCode) //nolint:errcheck // disconnect initiated by client
 	return io.EOF
+}
+
+// disconnectCause classifies a client DISCONNECT. Only Reason Code 0x00
+// discards the Will [MQTT-3.1.2-8]; 0x04 is the client ending the connection
+// itself and asking for the Will to go out, which stays an orderly end. A
+// packet the server refused, or any other Reason Code, is not.
+func disconnectCause(clientReason, serverReason byte) session.DisconnectCause {
+	if serverReason != v5.DisconnectNormalDisconnection {
+		return session.DisconnectAbnormal
+	}
+	switch clientReason {
+	case v5.DisconnectNormalDisconnection:
+		return session.DisconnectClean
+	case v5.DisconnectDisconnectWithWillMessage:
+		return session.DisconnectCleanWithWill
+	default:
+		return session.DisconnectAbnormal
+	}
 }
 
 // HandleAuth handles AUTH packets.
