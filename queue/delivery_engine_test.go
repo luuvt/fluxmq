@@ -1035,3 +1035,52 @@ func TestDeliverQueueAllExpiredReturnsNoDelivery(t *testing.T) {
 		t.Fatalf("expected 0 deliveries, got %d", deliveryCount)
 	}
 }
+
+// A stream group whose filter matches nothing in a long run of records used to
+// rescan the whole run on every pass, stalling every other queue on the node
+// (one delivery goroutine). The scan is now bounded per pass, and a pass that
+// stopped short reports progress so the queue is rescheduled rather than
+// waiting a tick per budget's worth of records.
+func TestDeliverQueueWalksNonMatchingRunInBoundedPasses(t *testing.T) {
+	const noise = 20_000 // well over the per-call scan budget
+
+	var mu sync.Mutex
+	var got []uint64
+	local := DeliveryTargetFunc(func(ctx context.Context, clientID string, msg *message.Envelope) error {
+		mu.Lock()
+		got = append(got, msg.BrokerMeta.Queue.Offset)
+		mu.Unlock()
+		return nil
+	})
+
+	engine, logStore, groupStore := newTestEngine(t, local, nil)
+	ctx := context.Background()
+	require.NoError(t, logStore.CreateQueue(ctx, types.DefaultQueueConfig("events", "$queue/events/#")))
+
+	group := types.NewConsumerGroupState("events", "channels", "group/+")
+	group.Mode = types.GroupModeStream
+	group.AutoCommit = true
+	group.SetConsumer("c1", &types.ConsumerInfo{ID: "c1", ClientID: "c1"})
+	require.NoError(t, groupStore.CreateConsumerGroup(ctx, group))
+
+	for i := range noise {
+		_, err := logStore.Append(ctx, "events", newQueueEnvelope(fmt.Sprint(i), "$queue/events/client/update", nil))
+		require.NoError(t, err)
+	}
+	_, err := logStore.Append(ctx, "events", newQueueEnvelope("match", "$queue/events/group/create", nil))
+	require.NoError(t, err)
+
+	passes := 0
+	for engine.DeliverQueue(ctx, "events") {
+		passes++
+		require.Less(t, passes, noise, "delivery never settled")
+	}
+
+	require.Greater(t, passes, 2, "the run must be walked across several bounded passes")
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []uint64{noise}, got)
+	fresh, err := groupStore.GetConsumerGroup(ctx, "events", "channels")
+	require.NoError(t, err)
+	require.Equal(t, uint64(noise+1), fresh.CursorView().Cursor)
+}

@@ -6,6 +6,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
@@ -35,6 +36,11 @@ var (
 	ErrDLQHandlerUnavailable         = errors.New("dead-letter queue handler unavailable")
 	ErrTransferInProgress            = errors.New("dead-letter transfer already in progress for this entry")
 	ErrDelayedNackUnsupported        = errors.New("delayed nack is not supported")
+
+	// ErrScanIncomplete is an ErrNoMessages from a cursor scan that stopped at
+	// maxCursorScan before reaching the tail: nothing matched so far, but more
+	// records remain, so the caller should come back soon rather than wait.
+	ErrScanIncomplete = fmt.Errorf("%w: scan budget exhausted before the tail", ErrNoMessages)
 )
 
 // Manager handles consumer group operations including claiming,
@@ -381,6 +387,7 @@ func (m *Manager) ClaimBatch(ctx context.Context, queueName, groupID, consumerID
 	}
 
 	var messages []*message.Envelope
+	noMessages := ErrNoMessages
 
 	// Claim from cursor
 	for len(messages) < limit {
@@ -388,6 +395,9 @@ func (m *Manager) ClaimBatch(ctx context.Context, queueName, groupID, consumerID
 		if err != nil {
 			if !errors.Is(err, ErrNoMessages) && !errors.Is(err, ErrPELFull) {
 				return messages, err
+			}
+			if errors.Is(err, ErrScanIncomplete) {
+				noMessages = ErrScanIncomplete
 			}
 			break
 		}
@@ -407,7 +417,7 @@ func (m *Manager) ClaimBatch(ctx context.Context, queueName, groupID, consumerID
 	}
 
 	if len(messages) == 0 {
-		return nil, ErrNoMessages
+		return nil, noMessages
 	}
 
 	return messages, nil
@@ -591,9 +601,9 @@ func (m *Manager) peekBatchStreamLocked(ctx context.Context, group *types.Consum
 	}
 
 	var messages []*message.Envelope
-	var newCursor uint64 = cursor.Cursor
+	newCursor := m.scanStart(ctx, group.QueueName, cursor.Cursor)
 
-	for newCursor < tail && len(messages) < limit {
+	for scanned := 0; newCursor < tail && len(messages) < limit && scanned < maxCursorScan; scanned++ {
 		offset := newCursor
 		newCursor++
 
@@ -625,7 +635,17 @@ func (m *Manager) peekBatchStreamLocked(ctx context.Context, group *types.Consum
 	}
 
 	if len(messages) == 0 {
-		return nil, cursor.Cursor, ErrNoMessages
+		// Nothing examined can ever be delivered to this group, so step the
+		// cursor past it now. Otherwise a group whose filter matches nothing
+		// keeps its cursor until a match arrives and every pass rescans the
+		// same, ever-growing range.
+		if err := m.updateStreamCursorLocked(ctx, group, newCursor); err != nil {
+			return nil, cursor.Cursor, err
+		}
+		if newCursor < tail {
+			return nil, newCursor, ErrScanIncomplete
+		}
+		return nil, newCursor, ErrNoMessages
 	}
 
 	return messages, newCursor, nil
@@ -700,8 +720,11 @@ func (m *Manager) claimFromCursor(ctx context.Context, group *types.ConsumerGrou
 		return nil, err
 	}
 
-	// Scan from cursor until we find a matching message or hit tail
-	for cursor.Cursor < tail {
+	// Scan from cursor until we find a matching message, hit tail, or reach
+	// the per-call scan bound.
+	start := m.scanStart(ctx, group.QueueName, cursor.Cursor)
+	cursor.Cursor = start
+	for scanned := 0; cursor.Cursor < tail && scanned < maxCursorScan; scanned++ {
 		offset := cursor.Cursor
 		cursor.Cursor++
 
@@ -752,7 +775,48 @@ func (m *Manager) claimFromCursor(ctx context.Context, group *types.ConsumerGrou
 		return msg, nil
 	}
 
+	// Everything examined was truncated, expired or outside the filter; step
+	// the cursor past it (see peekBatchStreamLocked). Re-read the group first:
+	// callers such as ClaimBatch reuse one snapshot across calls, and the
+	// cursor must never move backwards.
+	if cursor.Cursor > start {
+		fresh, err := m.groupStore.GetConsumerGroup(ctx, group.QueueName, group.ID)
+		if err != nil {
+			return nil, err
+		}
+		if cursor.Cursor > fresh.CursorView().Cursor {
+			if err := m.groupStore.UpdateCursor(ctx, group.QueueName, group.ID, cursor.Cursor); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if cursor.Cursor < tail {
+		return nil, ErrScanIncomplete
+	}
+
 	return nil, ErrNoMessages
+}
+
+// maxCursorScan bounds how many log records one claim or peek examines. The
+// delivery engine serves every queue and group of a node from a single
+// goroutine, so an unbounded scan by one group whose filter matches nothing
+// (a group/+ consumer over a log of client/update records, say) stalls
+// delivery for every other queue on that node for as long as the scan runs.
+// A scan cut short returns ErrScanIncomplete and the queue is rescheduled, so
+// the bound sets how long other queues wait behind one pass, not how fast a
+// group catches up. 1024 kept that wait near 150ms with 14 such groups
+// catching up on a 300k-record log; 4096 let it reach a second.
+const maxCursorScan = 1024
+
+// scanStart returns where a cursor scan should begin: the cursor itself, or
+// the queue's head when retention has truncated past the cursor, so the scan
+// does not probe every truncated offset one Read at a time.
+func (m *Manager) scanStart(ctx context.Context, queueName string, cursor uint64) uint64 {
+	head, err := m.queueStore.Head(ctx, queueName)
+	if err != nil || head <= cursor {
+		return cursor
+	}
+	return head
 }
 
 // stealWork tries to steal a message from another consumer's PEL.

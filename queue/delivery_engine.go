@@ -262,6 +262,12 @@ func (e *DeliveryEngine) deliverToGroup(ctx context.Context, config *types.Queue
 		if errors.Is(err, consumer.ErrNoMessages) {
 			releaseDeliverySources(outcome.Messages)
 			e.touchConsumerHeartbeat(ctx, config.Name, group.ID, consumerID)
+			if errors.Is(err, consumer.ErrScanIncomplete) {
+				// The cursor moved but more records remain: report progress
+				// so the queue is rescheduled behind the others instead of
+				// waiting for the next tick.
+				delivered = true
+			}
 			continue
 		}
 		if err != nil {
@@ -416,6 +422,9 @@ func (e *DeliveryEngine) deliverToRemoteConsumers(ctx context.Context, config *t
 			})
 			if err != nil {
 				releaseDeliverySources(outcome.Messages)
+				if errors.Is(err, consumer.ErrScanIncomplete) {
+					delivered = true
+				}
 				continue
 			}
 			msgs := outcome.Messages
