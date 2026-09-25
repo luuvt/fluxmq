@@ -25,6 +25,12 @@ var (
 	// accepted record; callers must retry by identity or establish a barrier
 	// over that record, never blindly append it again.
 	ErrDurabilityUnconfirmed = errors.New("write accepted but durability is unconfirmed")
+
+	// ErrUndecodableRecord reports a record whose bytes were read but cannot
+	// be decoded into an envelope, such as one written in an envelope version
+	// this build does not understand. Reading it again always fails the same
+	// way, so a consumer must step past it rather than retry it.
+	ErrUndecodableRecord = errors.New("undecodable queue record")
 )
 
 var (

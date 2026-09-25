@@ -839,7 +839,7 @@ func (a *Adapter) syncPELFromStore(queueName, groupID string, group *types.Consu
 func logMessageToEnvelope(msg *Message) (*message.Envelope, error) {
 	envelope, err := message.UnmarshalMetadata(msg.Headers[headerEnvelope], msg.Value, msg.Key)
 	if err != nil {
-		return nil, fmt.Errorf("decode queue envelope metadata at offset %d: %w", msg.Offset, err)
+		return nil, fmt.Errorf("%w: decode queue envelope metadata at offset %d: %w", storage.ErrUndecodableRecord, msg.Offset, err)
 	}
 	envelope.BrokerMeta.Queue.Offset = msg.Offset
 	if envelope.BrokerMeta.Queue.CreatedAt.IsZero() {

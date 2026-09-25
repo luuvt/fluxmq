@@ -503,6 +503,16 @@ func (m *Manager) ClaimPendingBatch(ctx context.Context, queueName, groupID, con
 	for _, entry := range entries {
 		msg, err := m.queueStore.Read(ctx, queueName, entry.Offset)
 		if err != nil {
+			if errors.Is(err, storage.ErrUndecodableRecord) {
+				// Nobody can ever be handed this entry; holding it would fail
+				// every later claim at the same place.
+				m.reportUndecodable(group, entry.Offset, err)
+				if err := m.groupStore.RemovePendingEntry(ctx, queueName, groupID, entry.ConsumerID, entry.Offset); err != nil {
+					releaseMessages(messages)
+					return nil, err
+				}
+				continue
+			}
 			releaseMessages(messages)
 			return nil, err
 		}
@@ -612,6 +622,10 @@ func (m *Manager) peekBatchStreamLocked(ctx context.Context, group *types.Consum
 			if errors.Is(err, storage.ErrOffsetOutOfRange) {
 				continue
 			}
+			if errors.Is(err, storage.ErrUndecodableRecord) {
+				m.reportUndecodable(group, offset, err)
+				continue
+			}
 			releaseMessages(messages)
 			return nil, cursor.Cursor, err
 		}
@@ -682,6 +696,18 @@ func (m *Manager) updateStreamCursorLocked(ctx context.Context, group *types.Con
 	return nil
 }
 
+// reportUndecodable logs a record a group steps past because it cannot be
+// decoded. Returning the error instead stalls the group at that offset for
+// good: envelope v0 records left at the head of a log after the v1 upgrade
+// stopped every group whose cursor was behind them.
+func (m *Manager) reportUndecodable(group *types.ConsumerGroup, offset uint64, err error) {
+	m.config.Logger.Warn("skipping undecodable queue record",
+		slog.String("queue", group.QueueName),
+		slog.String("group", group.ID),
+		slog.Uint64("offset", offset),
+		slog.String("error", err.Error()))
+}
+
 // autoCommitDue reports whether this group's auto-commit interval has elapsed,
 // recording the attempt when it has.
 func (m *Manager) autoCommitDue(key string) bool {
@@ -733,6 +759,10 @@ func (m *Manager) claimFromCursor(ctx context.Context, group *types.ConsumerGrou
 		if err != nil {
 			if errors.Is(err, storage.ErrOffsetOutOfRange) {
 				continue // Message was truncated, skip
+			}
+			if errors.Is(err, storage.ErrUndecodableRecord) {
+				m.reportUndecodable(group, offset, err)
+				continue
 			}
 			return nil, err
 		}
@@ -865,6 +895,11 @@ func (m *Manager) stealWorkFrom(ctx context.Context, group *types.ConsumerGroup,
 		// Read message
 		msg, err := m.queueStore.Read(ctx, group.QueueName, entry.Offset)
 		if err != nil {
+			if errors.Is(err, storage.ErrUndecodableRecord) {
+				// Left pending, it would hold a PEL slot forever.
+				m.reportUndecodable(group, entry.Offset, err)
+				_ = m.groupStore.RemovePendingEntry(ctx, group.QueueName, group.ID, entry.ConsumerID, entry.Offset)
+			}
 			continue // Message might be truncated
 		}
 
