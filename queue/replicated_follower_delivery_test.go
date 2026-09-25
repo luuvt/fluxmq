@@ -13,6 +13,7 @@ import (
 
 	"github.com/absmach/fluxmq/message"
 	clusterv1 "github.com/absmach/fluxmq/pkg/proto/cluster/v1"
+	"github.com/absmach/fluxmq/queue/raft"
 	memlog "github.com/absmach/fluxmq/queue/storage/memory/log"
 	"github.com/absmach/fluxmq/queue/types"
 )
@@ -160,5 +161,52 @@ func TestReplicatedManualStream_LeaderRoutesToConsumerOnFollower(t *testing.T) {
 	defer remote.mu.Unlock()
 	if len(remote.routed) != 1 || remote.routed[0].nodeID != "node-follower" || remote.routed[0].msg.BrokerMeta.Queue.Offset != 0 {
 		t.Fatalf("expected offset 0 routed to node-follower, got %+v", remote.routed)
+	}
+}
+
+// settleOnlyReplicator accepts every forwarded group op; the test is about
+// what the leader does after applying one, not the apply itself.
+type settleOnlyReplicator struct {
+	raft.GroupStateReplicator
+	removed int
+}
+
+func (r *settleOnlyReplicator) ApplyRemovePending(context.Context, string, string, string, uint64) error {
+	r.removed++
+	return nil
+}
+
+// Only the leader delivers a replicated queue, so an ack a follower forwards is
+// the leader's cue that a manual group's in-flight slot is free. Without a
+// schedule here the next record waited for the leader's periodic sweep.
+func TestForwardedSettlementSchedulesLeaderDelivery(t *testing.T) {
+	mgr := NewManager(memlog.New(), newMockGroupStore(), nil, DefaultConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	replicator := &settleOnlyReplicator{}
+	mgr.groupReplicator = replicator
+
+	wire, err := encodeGroupOperation(&raft.Operation{
+		Type:       raft.OpRemovePending,
+		QueueName:  "replicated",
+		GroupID:    "workers",
+		ConsumerID: "consumer-1",
+		Offset:     7,
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := mgr.HandleForwardedGroupOp(context.Background(), "replicated", wire); err != nil {
+		t.Fatalf("HandleForwardedGroupOp: %v", err)
+	}
+	if replicator.removed != 1 {
+		t.Fatalf("expected the settlement to be applied once, got %d", replicator.removed)
+	}
+
+	select {
+	case queueName := <-mgr.delivery.schedule.pending():
+		if queueName != "replicated" {
+			t.Fatalf("scheduled %q, want replicated", queueName)
+		}
+	default:
+		t.Fatal("a forwarded settlement must schedule delivery on the leader")
 	}
 }

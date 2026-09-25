@@ -2244,7 +2244,17 @@ func (m *Manager) HandleForwardedGroupOp(ctx context.Context, queueName string, 
 		return fmt.Errorf("queue name mismatch: request=%q op=%q", queueName, op.QueueName)
 	}
 
-	return m.applyGroupOp(ctx, op)
+	if err := m.applyGroupOp(ctx, op); err != nil {
+		return err
+	}
+	// Only the leader delivers a replicated queue, and a forwarded op is how it
+	// hears about what happened on a follower: an ack or nack settling a record
+	// frees a manual group's single in-flight slot, a registration brings a new
+	// consumer. The follower schedules delivery for itself and then skips it,
+	// so without this the leader waited for its periodic sweep, and a manual
+	// group consumed from a follower advanced about once a second.
+	m.delivery.Schedule(queueName)
+	return nil
 }
 
 func (m *Manager) applyGroupOp(ctx context.Context, op *raft.Operation) error {
