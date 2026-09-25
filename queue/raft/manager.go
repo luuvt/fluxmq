@@ -196,6 +196,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Create FSM that handles all queues
 	m.fsm = NewLogFSM(m.groupID(), m.queueStore, m.groupStore, m.logger)
 
+	if err := m.resetForLogReplay(ctx); err != nil {
+		raftDB.Close()
+		return err
+	}
+
 	// Create transport
 	addr, err := net.ResolveTCPAddr("tcp", m.bindAddr)
 	if err != nil {
@@ -249,6 +254,48 @@ func (m *Manager) Start(ctx context.Context) error {
 		slog.String("node_id", m.nodeID),
 		slog.String("bind_addr", m.bindAddr))
 
+	return nil
+}
+
+// resetForLogReplay clears this group's queues when raft is about to rebuild
+// them from the log alone.
+//
+// hashicorp/raft treats the FSM as volatile: on start it restores the newest
+// snapshot and then applies every committed entry after it. Restore discards
+// local state before laying the snapshot down, but with no snapshot nothing
+// does, and the queue store here is durable — the log would be replayed on top
+// of the records the previous run already wrote, appending each one again and
+// pointing cursors at the copies.
+//
+// Without a snapshot the log has never been compacted, so it still holds every
+// entry from the first and the replay rebuilds the whole state. A log that
+// starts later with no snapshot to cover the gap cannot be rebuilt, and
+// starting over it would serve a queue missing its head.
+func (m *Manager) resetForLogReplay(ctx context.Context) error {
+	snapshots, err := m.snapshotStore.List()
+	if err != nil {
+		return fmt.Errorf("failed to list raft snapshots: %w", err)
+	}
+	if len(snapshots) > 0 {
+		return nil
+	}
+
+	first, err := m.raftLogStore.FirstIndex()
+	if err != nil {
+		return fmt.Errorf("failed to read first raft log index: %w", err)
+	}
+	if first > 1 {
+		return fmt.Errorf("raft log starts at index %d but no snapshot covers the entries before it", first)
+	}
+
+	dropped, err := m.fsm.resetForReplay(ctx)
+	if err != nil {
+		return err
+	}
+	if len(dropped) > 0 {
+		m.logger.Info("cleared replicated queues to rebuild them from the raft log",
+			slog.Any("queues", dropped))
+	}
 	return nil
 }
 
