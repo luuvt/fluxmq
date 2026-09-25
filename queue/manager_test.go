@@ -2395,6 +2395,43 @@ func TestSubscribeWithCursorStreamDefaultResumesStoredCursor(t *testing.T) {
 	}
 }
 
+// A subscription that asks for manual commit without naming an offset reaches
+// the manager with the default position. The policy must survive the default
+// being filled in, both for a new group and for an existing auto-commit one.
+func TestSubscribeWithCursorStreamDefaultKeepsManualCommit(t *testing.T) {
+	logStore := memlog.New()
+	groupStore := newMockGroupStore()
+	manager := NewManager(logStore, groupStore, DeliveryTargetFunc(func(context.Context, string, *message.Envelope) error { return nil }), DefaultConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	ctx := context.Background()
+
+	queueCfg := types.DefaultQueueConfig(testQueueEvents, "$queue/events/#")
+	queueCfg.Type = types.QueueTypeStream
+	if err := manager.CreateQueue(ctx, queueCfg); err != nil {
+		t.Fatalf("CreateQueue failed: %v", err)
+	}
+
+	existing := types.NewConsumerGroupState(testQueueEvents, "auto-then-manual", "")
+	existing.Mode = types.GroupModeStream
+	if err := groupStore.CreateConsumerGroup(ctx, existing); err != nil {
+		t.Fatalf("CreateConsumerGroup failed: %v", err)
+	}
+
+	manual := false
+	for _, groupID := range []string{"new-manual", "auto-then-manual"} {
+		cursor := &types.CursorOption{Position: types.CursorDefault, Mode: types.GroupModeStream, AutoCommit: &manual}
+		if err := manager.SubscribeWithCursor(ctx, testQueueEvents, "", testClientOneID, groupID, "", cursor); err != nil {
+			t.Fatalf("SubscribeWithCursor(%s) failed: %v", groupID, err)
+		}
+		stored, err := groupStore.GetConsumerGroup(ctx, testQueueEvents, groupID)
+		if err != nil {
+			t.Fatalf("GetConsumerGroup(%s) failed: %v", groupID, err)
+		}
+		if stored.AutoCommitEnabled() {
+			t.Fatalf("group %s: manual commit requested with the default position, got auto-commit", groupID)
+		}
+	}
+}
+
 func TestSubscribeWithCursorStreamFirstResumesExistingGroup(t *testing.T) {
 	logStore := memlog.New()
 	groupStore := newMockGroupStore()

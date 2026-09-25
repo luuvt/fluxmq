@@ -1457,7 +1457,16 @@ func (m *Manager) subscribeWithCursor(ctx context.Context, queueName, pattern st
 		if mode != types.GroupModeStream {
 			return m.subscribe(ctx, queueName, pattern, clientID, groupID, proxyNodeID, allowQueueMutation)
 		}
-		cursor = &types.CursorOption{Position: types.CursorDefault, Mode: mode}
+		// The auto-commit policy travels with the cursor and must survive the
+		// default position being filled in. Dropping it here turned every stream
+		// subscription that asked for manual commit without naming an offset into
+		// an auto-commit one: deliveries settled on hand-off, and records a
+		// consumer died holding were never delivered again.
+		var autoCommit *bool
+		if cursor != nil {
+			autoCommit = cursor.AutoCommit
+		}
+		cursor = &types.CursorOption{Position: types.CursorDefault, Mode: mode, AutoCommit: autoCommit}
 	}
 
 	var (
