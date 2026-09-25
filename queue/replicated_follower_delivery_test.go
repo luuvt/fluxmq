@@ -210,3 +210,44 @@ func TestForwardedSettlementSchedulesLeaderDelivery(t *testing.T) {
 		t.Fatal("a forwarded settlement must schedule delivery on the leader")
 	}
 }
+
+// The pull API reaches the state machine without passing the delivery engine's
+// leader check. On a follower it would claim from the same lagging view, so it
+// must refuse, retryably and naming the leader as not local; on the leader it
+// serves the claim.
+func TestReplicatedPullClaimRequiresLeader(t *testing.T) {
+	for _, isLeader := range []bool{false, true} {
+		manager, forwarder, _ := newReplicatedManualStreamNode(t, isLeader, "")
+		ctx := context.Background()
+
+		consumeOutcome, consumeErr := manager.StateMachine().Consume(ctx, ConsumeCommand{
+			QueueName: "replication", GroupID: "channels@aiot_cloud/group/+", ConsumerID: "consumer-1", Limit: 10,
+		})
+		releaseEnvelopes(consumeOutcome.Messages)
+		_, claimErr := manager.StateMachine().Claim(ctx, ClaimCommand{
+			QueueName: "replication", GroupID: "channels@aiot_cloud/group/+", ConsumerID: "consumer-1", Limit: 10,
+		})
+
+		if isLeader {
+			if consumeErr != nil {
+				t.Fatalf("leader: Consume failed: %v", consumeErr)
+			}
+			// Claim takes over idle pending entries of a queue-mode group, so
+			// on this stream group it fails for its own reason; what matters is
+			// that the leader is not the reason.
+			if claimErr != nil && ClassifyError(claimErr).Leader == LeaderNotLocal {
+				t.Fatalf("leader: Claim refused as not leader: %v", claimErr)
+			}
+			continue
+		}
+		for name, err := range map[string]error{"Consume": consumeErr, "Claim": claimErr} {
+			failure := ClassifyError(err)
+			if err == nil || failure.Leader != LeaderNotLocal || !failure.Retryable {
+				t.Fatalf("follower: %s must refuse with a retryable not-local failure, got %v", name, err)
+			}
+		}
+		if ops := forwarder.recorded(); len(ops) > 0 {
+			t.Fatalf("follower: a refused claim forwarded group mutations: %v", ops)
+		}
+	}
+}

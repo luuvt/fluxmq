@@ -301,6 +301,9 @@ func (s *stateMachine) Consume(ctx context.Context, command ConsumeCommand) (Con
 	if err := validateConsumerCommand(command.QueueName, command.GroupID, command.ConsumerID); err != nil {
 		return ConsumeOutcome{}, err
 	}
+	if err := s.requireReplicationLeader(command.QueueName); err != nil {
+		return ConsumeOutcome{}, err
+	}
 	group, err := s.groupStore.GetConsumerGroup(ctx, command.QueueName, command.GroupID)
 	if err != nil {
 		return ConsumeOutcome{}, err
@@ -475,6 +478,9 @@ func (s *stateMachine) Claim(ctx context.Context, command ClaimCommand) (ClaimOu
 	if command.MinIdle < 0 {
 		return ClaimOutcome{}, fmt.Errorf("%w: minimum idle time cannot be negative", ErrInvalidCommand)
 	}
+	if err := s.requireReplicationLeader(command.QueueName); err != nil {
+		return ClaimOutcome{}, err
+	}
 	messages, err := s.consumers.ClaimPendingBatch(ctx, command.QueueName, command.GroupID, command.ConsumerID, command.MinIdle, command.Limit)
 	if err != nil {
 		return ClaimOutcome{}, err
@@ -484,6 +490,31 @@ func (s *stateMachine) Claim(ctx context.Context, command ClaimCommand) (ClaimOu
 		outcome.Offsets[i] = message.BrokerMeta.Queue.Offset
 	}
 	return outcome, nil
+}
+
+// requireReplicationLeader refuses a claim on a follower of a replicated queue.
+//
+// A claim reads the consumer group from this node's store and forwards what it
+// changes to the leader. A follower's store trails the leader's by the raft
+// apply delay, so a claim served from it hands out records the leader already
+// delivered and forwards a cursor computed from the stale view, which the
+// leader applies as-is and moves the group backwards. The delivery engine only
+// runs a replicated queue on its leader for that reason; this covers the
+// callers that reach the state machine directly, the pull API among them.
+func (s *stateMachine) requireReplicationLeader(queueName string) error {
+	coordinator := s.records.services.replicationCoordinator()
+	if coordinator == nil || !coordinator.IsQueueReplicated(queueName) || coordinator.IsLeaderForQueue(queueName) {
+		return nil
+	}
+	return WithFailure(
+		fmt.Errorf("%w: queue %q is not led by this node", ErrReplicationUnavailable, queueName),
+		Failure{
+			Code:       ErrorCodeUnavailable,
+			Retryable:  true,
+			Leader:     LeaderNotLocal,
+			Durability: DurabilityNotAttempted,
+		},
+	)
 }
 
 // Seek resolves a bounded queue offset.
