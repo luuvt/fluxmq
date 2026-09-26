@@ -116,20 +116,92 @@ func TestLogFSMSettlementOfMissingEntryIsRefusedNotFatal(t *testing.T) {
 	for name, apply := range ops {
 		var result *ApplyResult
 		require.NotPanics(t, func() { result = apply() }, name)
-		switch name {
-		case "remove":
+		if name == "remove" {
 			require.NoError(t, result.Error, "an already settled record stays settled")
-		case "transfer":
-			// The adapter's offset-keyed claim tolerates a missing offset; the
-			// memory store refuses it. Either way nothing may stop.
-			if result.Error != nil {
-				require.ErrorIs(t, result.Error, storage.ErrPendingEntryNotFound, name)
-			}
-		default:
-			require.ErrorIs(t, result.Error, storage.ErrPendingEntryNotFound, name)
+			continue
 		}
+		require.ErrorIs(t, result.Error, storage.ErrPendingEntryNotFound, name)
 	}
 
 	_, owner := pendingOwnerOf(t, fsm.groupStore.(*logstorage.Adapter), raceOffset)
 	require.Equal(t, raceNewOwner, owner, "a refused settlement leaves other entries alone")
+}
+
+// A transfer naming a sender that no longer holds the entry must change
+// nothing. The adapter's offset-keyed store used to take it anyway while the
+// group state kept the entry where it was, so the two disagreed on the owner.
+func TestLogFSMTransferFromWrongSenderChangesNothing(t *testing.T) {
+	fsm, adapter := newTransferredEntryFSM(t)
+
+	result := fsm.applyTransferPending(context.Background(), &Operation{
+		Type: OpTransferPending, QueueName: testOperationQueue, GroupID: testOperationGroup,
+		Offset: raceOffset, FromConsumer: testOperationConsumerA, ToConsumer: testOperationConsumerB,
+	})
+
+	require.ErrorIs(t, result.Error, storage.ErrPendingEntryNotFound)
+	_, owner := pendingOwnerOf(t, adapter, raceOffset)
+	require.Equal(t, raceNewOwner, owner)
+	entries, err := adapter.GetPendingEntries(context.Background(), testOperationQueue, testOperationGroup, testOperationConsumerB)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the store must not have moved the entry either")
+}
+
+// An ephemeral group is deleted when its last consumer leaves, while a
+// heartbeat, an ack or a cursor update for it can still be in flight from a
+// follower. Each replica applies them after the delete and fails alike, so they
+// are refused; stopping the node stopped every replica.
+func TestLogFSMGroupOpsAfterGroupDeletedAreRefusedNotFatal(t *testing.T) {
+	fsm, adapter := newTransferredEntryFSM(t)
+	ctx := context.Background()
+	require.NoError(t, adapter.DeleteConsumerGroup(ctx, testOperationQueue, testOperationGroup))
+
+	base := Operation{QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: raceNewOwner, Offset: raceOffset}
+	with := func(mutate func(*Operation)) *Operation {
+		op := base
+		mutate(&op)
+		return &op
+	}
+	ops := map[string]func() *ApplyResult{
+		"remove pending": func() *ApplyResult {
+			return fsm.applyRemovePending(ctx, with(func(op *Operation) { op.Type = OpRemovePending }))
+		},
+		"requeue pending": func() *ApplyResult {
+			return fsm.applyRequeuePending(ctx, with(func(op *Operation) { op.Type, op.Timestamp = OpRequeuePending, conformanceTime }))
+		},
+		"transfer pending": func() *ApplyResult {
+			return fsm.applyTransferPending(ctx, with(func(op *Operation) {
+				op.Type, op.FromConsumer, op.ToConsumer = OpTransferPending, raceNewOwner, testOperationConsumerB
+			}))
+		},
+		"add pending": func() *ApplyResult {
+			return fsm.applyAddPending(ctx, with(func(op *Operation) {
+				op.Type = OpAddPending
+				op.PendingEntry = &types.PendingEntry{Offset: raceOffset + 1, ConsumerID: raceNewOwner, ClaimedAt: conformanceTime, DeliveryCount: 1}
+			}))
+		},
+		"update cursor": func() *ApplyResult {
+			return fsm.applyUpdateCursor(ctx, with(func(op *Operation) { op.Type, op.Cursor = OpUpdateCursor, raceOffset+1 }))
+		},
+		"register consumer": func() *ApplyResult {
+			return fsm.applyRegisterConsumer(ctx, with(func(op *Operation) {
+				op.Type = OpRegisterConsumer
+				op.ConsumerInfo = &types.ConsumerInfo{ID: raceNewOwner, ClientID: raceNewOwner, RegisteredAt: conformanceTime, LastHeartbeat: conformanceTime}
+			}))
+		},
+		"unregister consumer": func() *ApplyResult {
+			return fsm.applyUnregisterConsumer(ctx, with(func(op *Operation) { op.Type = OpUnregisterConsumer }))
+		},
+		"delete group": func() *ApplyResult {
+			return fsm.applyDeleteGroup(ctx, with(func(op *Operation) { op.Type = OpDeleteGroup }))
+		},
+	}
+	for name, apply := range ops {
+		var result *ApplyResult
+		require.NotPanics(t, func() { result = apply() }, name)
+		// Some ops find nothing left to do and succeed (a second delete); the
+		// rest must be refused as a missing group, not as a local failure.
+		if result.Error != nil {
+			require.ErrorIs(t, result.Error, storage.ErrConsumerGroupNotFound, name)
+		}
+	}
 }

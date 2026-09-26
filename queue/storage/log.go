@@ -20,6 +20,11 @@ var (
 	ErrConsumerGroupExists  = errors.New("consumer group already exists")
 	ErrPendingEntryNotFound = errors.New("pending entry not found")
 
+	// ErrConsumerGroupNotFound reports a group the store does not hold. Stores
+	// return it (or wrap it) so callers outside the store package, the raft FSM
+	// among them, can tell a group that was deleted from a store failure.
+	ErrConsumerGroupNotFound = errors.New("consumer group not found")
+
 	// ErrDurabilityUnconfirmed reports that a write was accepted but its
 	// durability barrier did not complete. The returned offset identifies the
 	// accepted record; callers must retry by identity or establish a barrier

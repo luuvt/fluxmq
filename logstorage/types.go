@@ -6,6 +6,8 @@ package logstorage
 import (
 	"errors"
 	"time"
+
+	"github.com/absmach/fluxmq/queue/storage"
 )
 
 // Storage errors.
@@ -21,7 +23,7 @@ var (
 	ErrBatchTooLarge    = errors.New("batch exceeds maximum size")
 	ErrEmptyBatch       = errors.New("batch contains no records")
 	ErrConsumerNotFound = errors.New("consumer not found")
-	ErrGroupNotFound    = errors.New("consumer group not found")
+	ErrGroupNotFound    = storage.ErrConsumerGroupNotFound // shared, so the raft FSM can recognise it
 	ErrQueueNotFound    = errors.New("queue not found")
 	ErrAlreadyExists    = errors.New("already exists")
 	ErrInvalidOffset    = errors.New("invalid offset")

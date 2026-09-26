@@ -431,6 +431,9 @@ func (f *LogFSM) applyCreateGroup(ctx context.Context, op *Operation) *ApplyResu
 
 func (f *LogFSM) applyDeleteGroup(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.DeleteConsumerGroup(ctx, op.QueueName, op.GroupID)
+	if staleTarget(err) {
+		return f.refuseStale("delete group", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply delete group",
 			slog.String("queue", op.QueueName),
@@ -469,6 +472,9 @@ func (f *LogFSM) applyUpdateGroup(ctx context.Context, op *Operation) *ApplyResu
 
 func (f *LogFSM) applyUpdateCursor(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.UpdateCursor(ctx, op.QueueName, op.GroupID, op.Cursor)
+	if staleTarget(err) {
+		return f.refuseStale("update cursor", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply update cursor",
 			slog.String("queue", op.QueueName),
@@ -483,6 +489,9 @@ func (f *LogFSM) applyUpdateCursor(ctx context.Context, op *Operation) *ApplyRes
 
 func (f *LogFSM) applyUpdateCommitted(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.UpdateCommitted(ctx, op.QueueName, op.GroupID, op.Committed)
+	if staleTarget(err) {
+		return f.refuseStale("update committed", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply update committed",
 			slog.String("queue", op.QueueName),
@@ -501,6 +510,9 @@ func (f *LogFSM) applyAddPending(ctx context.Context, op *Operation) *ApplyResul
 	}
 
 	err := f.groupStore.AddPendingEntry(ctx, op.QueueName, op.GroupID, op.PendingEntry)
+	if staleTarget(err) {
+		return f.refuseStale("add pending", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply add pending",
 			slog.String("queue", op.QueueName),
@@ -516,7 +528,14 @@ func (f *LogFSM) applyAddPending(ctx context.Context, op *Operation) *ApplyResul
 func (f *LogFSM) applyRemovePending(ctx context.Context, op *Operation) *ApplyResult {
 	owner := f.pendingOwner(ctx, op)
 	err := f.groupStore.RemovePendingEntry(ctx, op.QueueName, op.GroupID, owner, op.Offset)
-	if err != nil && !errors.Is(err, storage.ErrPendingEntryNotFound) {
+	if errors.Is(err, storage.ErrPendingEntryNotFound) {
+		// Already settled: an ack that lost a race with another is no error.
+		return &ApplyResult{}
+	}
+	if staleTarget(err) {
+		return f.refuseStale("remove pending", op, err)
+	}
+	if err != nil {
 		f.logger.Error("failed to apply remove pending",
 			slog.String("queue", op.QueueName),
 			slog.String("group", op.GroupID),
@@ -531,14 +550,8 @@ func (f *LogFSM) applyRemovePending(ctx context.Context, op *Operation) *ApplyRe
 
 func (f *LogFSM) applyTransferPending(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.TransferPendingEntry(ctx, op.QueueName, op.GroupID, op.Offset, op.FromConsumer, op.ToConsumer)
-	if settlementRaced(err) {
-		f.logger.Warn("transfer pending skipped: entry no longer held by its sender",
-			slog.String("queue", op.QueueName),
-			slog.String("group", op.GroupID),
-			slog.Uint64("offset", op.Offset),
-			slog.String("from", op.FromConsumer),
-			slog.String("error", err.Error()))
-		return &ApplyResult{Error: err}
+	if staleTarget(err) {
+		return f.refuseStale("transfer pending", op, err)
 	}
 	if err != nil {
 		f.logger.Error("failed to apply transfer pending",
@@ -561,14 +574,8 @@ func (f *LogFSM) applyRequeuePending(ctx context.Context, op *Operation) *ApplyR
 	}
 	owner := f.pendingOwner(ctx, op)
 	err := requeuer.RequeuePendingEntry(ctx, op.QueueName, op.GroupID, owner, op.Offset, op.Timestamp)
-	if settlementRaced(err) {
-		f.logger.Warn("requeue pending skipped: entry no longer pending",
-			slog.String("queue", op.QueueName),
-			slog.String("group", op.GroupID),
-			slog.String("consumer", owner),
-			slog.Uint64("offset", op.Offset),
-			slog.String("error", err.Error()))
-		return &ApplyResult{Error: err}
+	if staleTarget(err) {
+		return f.refuseStale("requeue pending", op, err)
 	}
 	if err != nil {
 		f.logger.Error("failed to apply requeue pending",
@@ -605,13 +612,27 @@ func (f *LogFSM) pendingOwner(ctx context.Context, op *Operation) string {
 	return op.ConsumerID
 }
 
-// settlementRaced reports a pending-entry mutation that found the entry gone or
-// held by someone else. The proposer acted on state that changed before the op
-// was applied, a race every replica resolves identically, so it is refused like
-// any deterministic refusal rather than stopping the node (see
-// stopLocalFailure).
-func settlementRaced(err error) bool {
-	return errors.Is(err, storage.ErrPendingEntryNotFound) || errors.Is(err, storage.ErrConsumerNotFound)
+// staleTarget reports a group mutation whose target -- the group, the consumer
+// or the pending entry -- is gone, or held by someone else, by the time the
+// entry is applied. The proposer acted on state that changed in between: a
+// settlement from a follower that had not applied a transfer yet, a heartbeat
+// or an ack for an ephemeral group deleted meanwhile. Every replica holds the
+// same state at this index and fails the same way, so it is a deterministic
+// refusal, not a local failure (see stopLocalFailure).
+func staleTarget(err error) bool {
+	return errors.Is(err, storage.ErrPendingEntryNotFound) ||
+		errors.Is(err, storage.ErrConsumerNotFound) ||
+		errors.Is(err, storage.ErrConsumerGroupNotFound)
+}
+
+func (f *LogFSM) refuseStale(what string, op *Operation, err error) *ApplyResult {
+	f.logger.Warn(what+" skipped: target no longer exists",
+		slog.String("queue", op.QueueName),
+		slog.String("group", op.GroupID),
+		slog.String("consumer", op.ConsumerID),
+		slog.Uint64("offset", op.Offset),
+		slog.String("error", err.Error()))
+	return &ApplyResult{Error: err}
 }
 
 func (f *LogFSM) applyRegisterConsumer(ctx context.Context, op *Operation) *ApplyResult {
@@ -620,6 +641,9 @@ func (f *LogFSM) applyRegisterConsumer(ctx context.Context, op *Operation) *Appl
 	}
 
 	err := f.groupStore.RegisterConsumer(ctx, op.QueueName, op.GroupID, op.ConsumerInfo)
+	if staleTarget(err) {
+		return f.refuseStale("register consumer", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply register consumer",
 			slog.String("queue", op.QueueName),
@@ -639,6 +663,9 @@ func (f *LogFSM) applyRegisterConsumer(ctx context.Context, op *Operation) *Appl
 
 func (f *LogFSM) applyUnregisterConsumer(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.UnregisterConsumer(ctx, op.QueueName, op.GroupID, op.ConsumerID)
+	if staleTarget(err) {
+		return f.refuseStale("unregister consumer", op, err)
+	}
 	if err != nil {
 		f.logger.Error("failed to apply unregister consumer",
 			slog.String("queue", op.QueueName),
