@@ -210,6 +210,33 @@ func TestClaimManualStreamRedeliversOrphanImmediately(t *testing.T) {
 	assert.Equal(t, 2, entry.DeliveryCount)
 }
 
+// The consumer list the delivery engine walks can still name a consumer that
+// already left the group. Its entry is free for anyone else at once, but must
+// not go back to it: that delivery fails and still spends an attempt.
+func TestClaimManualStreamDoesNotHandOrphanBackToDepartedOwner(t *testing.T) {
+	ctx := context.Background()
+	manager, store, _ := newManualStreamFixture(t, 1)
+
+	first, err := manager.ClaimManualStream(ctx, testStreamQueue, testStreamGroup, testStreamConsumer, nil)
+	require.NoError(t, err)
+	require.NoError(t, manager.UnregisterConsumer(ctx, testStreamQueue, testStreamGroup, testStreamConsumer))
+
+	_, err = manager.ClaimManualStream(ctx, testStreamQueue, testStreamGroup, testStreamConsumer, nil)
+	assert.ErrorIs(t, err, ErrNoMessages)
+
+	group, err := store.GetConsumerGroup(ctx, testStreamQueue, testStreamGroup)
+	require.NoError(t, err)
+	entry, owner := group.FindPending(first.BrokerMeta.Queue.Offset)
+	assert.Equal(t, testStreamConsumer, owner)
+	assert.Equal(t, 1, entry.DeliveryCount, "a delivery to a departed owner must not cost an attempt")
+
+	const nextConsumer = "consumer-2"
+	require.NoError(t, manager.RegisterConsumer(ctx, testStreamQueue, testStreamGroup, nextConsumer, nextConsumer, ""))
+	again, err := manager.ClaimManualStream(ctx, testStreamQueue, testStreamGroup, nextConsumer, nil)
+	require.NoError(t, err)
+	assert.Equal(t, first.BrokerMeta.Queue.Offset, again.BrokerMeta.Queue.Offset)
+}
+
 // Reconnect cycles must not walk an entry to the dead-letter queue on their
 // own. Only deliveries that actually reached the consumer count as attempts.
 func TestClaimManualStreamCountsOneAttemptPerRedelivery(t *testing.T) {

@@ -871,8 +871,17 @@ func (m *Manager) stealWorkFrom(ctx context.Context, group *types.ConsumerGroup,
 	}
 
 	// Try to steal the oldest entry
+	lapsedBefore := time.Now().Add(-m.config.VisibilityTimeout)
 	for _, entry := range stealable {
 		if ownerOnly != "" && entry.ConsumerID != ownerOnly {
+			continue
+		}
+		// An owner that left the group makes its entries stealable at once,
+		// but only for the others. Taking its own back early handed an
+		// in-flight record straight back to a consumer that was disconnecting
+		// (the delivery then failed) and spent one of its delivery attempts
+		// each time; a consumer retries its own entries once they lapse.
+		if ownerOnly != "" && !entry.ClaimedAt.Before(lapsedBefore) {
 			continue
 		}
 		if m.transferring(group.QueueName, group.ID, entry.Offset) {
