@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/absmach/fluxmq/message"
 	clusterv1 "github.com/absmach/fluxmq/pkg/proto/cluster/v1"
@@ -249,5 +250,45 @@ func TestReplicatedPullClaimRequiresLeader(t *testing.T) {
 		if ops := forwarder.recorded(); len(ops) > 0 {
 			t.Fatalf("follower: a refused claim forwarded group mutations: %v", ops)
 		}
+	}
+}
+
+// A settlement that names its consumer checks ownership against this node's
+// pending list, which on a follower trails the leader's: right after a
+// redelivery moved an entry, the follower still shows the previous owner and
+// refused the new owner's own ack. Such settlements go to the leader; the
+// adapters' settlements, which name no consumer, still work from a follower.
+func TestReplicatedOwnedSettlementRequiresLeader(t *testing.T) {
+	const (
+		queueName = "replication"
+		groupID   = "channels@aiot_cloud/group/+"
+		owner     = "consumer-1"
+	)
+	ctx := context.Background()
+	manager, forwarder, _ := newReplicatedManualStreamNode(t, false, "")
+	if err := manager.raftGroupStore.base.AddPendingEntry(ctx, queueName, groupID, &types.PendingEntry{
+		Offset: 0, ConsumerID: owner, ClaimedAt: time.Now(), DeliveryCount: 1,
+	}); err != nil {
+		t.Fatalf("AddPendingEntry: %v", err)
+	}
+
+	_, ackErr := manager.StateMachine().Ack(ctx, AckCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
+	_, nackErr := manager.StateMachine().Nack(ctx, NackCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
+	_, rejectErr := manager.StateMachine().Reject(ctx, RejectCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
+	for name, err := range map[string]error{"Ack": ackErr, "Nack": nackErr, "Reject": rejectErr} {
+		failure := ClassifyError(err)
+		if err == nil || failure.Leader != LeaderNotLocal || !failure.Retryable {
+			t.Fatalf("follower: %s naming its consumer must refuse with a retryable not-local failure, got %v", name, err)
+		}
+	}
+	if ops := forwarder.recorded(); len(ops) > 0 {
+		t.Fatalf("follower: a refused settlement forwarded group mutations: %v", ops)
+	}
+
+	if _, err := manager.StateMachine().Ack(ctx, AckCommand{QueueName: queueName, GroupID: groupID, Offsets: []uint64{0}}); err != nil {
+		t.Fatalf("follower: an adapter ack naming no consumer must still be forwarded, got %v", err)
+	}
+	if ops := forwarder.recorded(); len(ops) == 0 || ops[0] != "*clusterv1.GroupOperation_RemovePending" {
+		t.Fatalf("follower: expected the adapter ack forwarded as a settlement, got %v", ops)
 	}
 }

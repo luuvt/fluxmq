@@ -363,6 +363,9 @@ func (s *stateMachine) Ack(ctx context.Context, command AckCommand) (SettlementO
 	if err := validateSettlementCommand(command.QueueName, command.Offsets); err != nil {
 		return SettlementOutcome{}, err
 	}
+	if err := s.requireOwnershipLeader(command.QueueName, command.ConsumerID); err != nil {
+		return SettlementOutcome{}, err
+	}
 	resolver, err := s.newSettlementResolver(ctx, command.QueueName, command.GroupID)
 	if err != nil {
 		return SettlementOutcome{}, err
@@ -407,6 +410,9 @@ func (s *stateMachine) Nack(ctx context.Context, command NackCommand) (Settlemen
 	if err := validateSettlementCommand(command.QueueName, command.Offsets); err != nil {
 		return SettlementOutcome{}, err
 	}
+	if err := s.requireOwnershipLeader(command.QueueName, command.ConsumerID); err != nil {
+		return SettlementOutcome{}, err
+	}
 	if command.Delay < 0 {
 		return SettlementOutcome{}, fmt.Errorf("%w: nack delay cannot be negative", ErrInvalidCommand)
 	}
@@ -439,6 +445,9 @@ func (s *stateMachine) Nack(ctx context.Context, command NackCommand) (Settlemen
 // Reject applies a dead-letter rejection command.
 func (s *stateMachine) Reject(ctx context.Context, command RejectCommand) (SettlementOutcome, error) {
 	if err := validateSettlementCommand(command.QueueName, command.Offsets); err != nil {
+		return SettlementOutcome{}, err
+	}
+	if err := s.requireOwnershipLeader(command.QueueName, command.ConsumerID); err != nil {
 		return SettlementOutcome{}, err
 	}
 	resolver, err := s.newSettlementResolver(ctx, command.QueueName, command.GroupID)
@@ -515,6 +524,20 @@ func (s *stateMachine) requireReplicationLeader(queueName string) error {
 			Durability: DurabilityNotAttempted,
 		},
 	)
+}
+
+// requireOwnershipLeader refuses, on a follower of a replicated queue, a
+// settlement that names its consumer. The ownership check reads the pending
+// list from this node's store, which trails the leader's: right after a
+// redelivery moved an entry to its new owner, the follower still shows the
+// previous one and refused the new owner's own ack. The leader's view is
+// current. Settlements without a consumer (the AMQP and MQTT adapters) carry
+// no ownership check and still work from any node.
+func (s *stateMachine) requireOwnershipLeader(queueName, consumerID string) error {
+	if consumerID == "" {
+		return nil
+	}
+	return s.requireReplicationLeader(queueName)
 }
 
 // Seek resolves a bounded queue offset.
