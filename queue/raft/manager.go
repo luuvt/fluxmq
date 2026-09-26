@@ -60,6 +60,12 @@ type Manager struct {
 
 	mu     sync.RWMutex
 	stopCh chan struct{}
+
+	// verifiedAt and verifiedTerm record the last quorum confirmation of this
+	// node's leadership (see VerifyLeader).
+	verifyMu     sync.Mutex
+	verifiedAt   time.Time
+	verifiedTerm uint64
 }
 
 // ManagerConfig holds configuration for the Raft manager.
@@ -474,6 +480,67 @@ func (m *Manager) IsLeader(_ context.Context) bool {
 		return false
 	}
 	return m.raft.State() == raft.Leader
+}
+
+// CurrentTerm returns the latest raft term this node has seen, zero when raft
+// is not running.
+func (m *Manager) CurrentTerm() uint64 {
+	if m.raft == nil {
+		return 0
+	}
+	return m.raft.CurrentTerm()
+}
+
+// VerifyLeader confirms with a quorum that this node still leads the group.
+//
+// State() reports what this node believes, and a leader that was paused or cut
+// off keeps believing it until it hears from a peer: it delivers from its own
+// view meanwhile, while a newer leader delivers the same records. A quorum that
+// answered at t has reset its election timers, so no other leader can exist
+// before t plus the heartbeat timeout; a confirmation is therefore reused for a
+// short fraction of that, within the same term, instead of costing a round
+// trip on every delivery pass.
+func (m *Manager) VerifyLeader(ctx context.Context) error {
+	if m.raft == nil {
+		return ErrRaftDisabled
+	}
+
+	started := time.Now()
+	term := m.raft.CurrentTerm()
+	m.verifyMu.Lock()
+	reusable := m.verifiedTerm == term && started.Sub(m.verifiedAt) < m.leaderVerifyReuse()
+	m.verifyMu.Unlock()
+	if reusable && m.raft.State() == raft.Leader {
+		return nil
+	}
+
+	future := m.raft.VerifyLeader()
+	done := make(chan error, 1)
+	go func() { done <- future.Error() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Stamped with the moment the check began: the quorum answered after it,
+	// so this under-states how recent the confirmation is, never over-states.
+	m.verifyMu.Lock()
+	m.verifiedAt = started
+	m.verifiedTerm = term
+	m.verifyMu.Unlock()
+	return nil
+}
+
+func (m *Manager) leaderVerifyReuse() time.Duration {
+	reuse := m.config.HeartbeatTimeout / 4
+	if reuse <= 0 || reuse > 200*time.Millisecond {
+		reuse = 200 * time.Millisecond
+	}
+	return reuse
 }
 
 // Leader returns the current leader's address.

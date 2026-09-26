@@ -247,6 +247,11 @@ message RouteQueueMessageRequest {
   // the string map: it was a synthesized queue:offset that overwrote whatever
   // the publisher had set, and sequence already carries the offset.
   bytes envelope = 8;
+  // leader_term is the raft term of the leader that claimed this delivery of a
+  // replicated queue, zero otherwise. A receiver that has already seen a newer
+  // term refuses it: the sender was deposed, and the newer leader delivers the
+  // record from its own view.
+  uint64 leader_term = 9;
 }
 
 message RouteQueueMessageResponse {
@@ -269,6 +274,9 @@ message RouteQueueBatchError {
   // client_not_connected signals the delivery target had no live connection,
   // so the sender can evict the stale consumer without parsing error text.
   bool client_not_connected = 5;
+  // stale_leader signals a delivery refused because its leader_term is older
+  // than the receiver's term. Retrying cannot succeed; the sender is deposed.
+  bool stale_leader = 6;
 }
 
 message RouteQueueBatchResponse {

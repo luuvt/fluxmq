@@ -49,6 +49,10 @@ type DeliveryEngine struct {
 	// replicatedFollower reports whether this node is a follower (not the
 	// Raft leader) of the named replicated queue. nil means single-node.
 	replicatedFollower func(queueName string) bool
+	// leaderTerm and verifyLeader fence a replicated queue's deliveries against
+	// a deposed leader (see deliverQueueConfig). nil means no fencing.
+	leaderTerm   func(queueName string) uint64
+	verifyLeader func(ctx context.Context, queueName string) error
 
 	schedule *deliveryQueue
 
@@ -93,6 +97,11 @@ func (e *DeliveryEngine) setConsumerRemovedCallback(callback func(context.Contex
 
 func (e *DeliveryEngine) setReplicatedFollowerCheck(check func(queueName string) bool) {
 	e.replicatedFollower = check
+}
+
+func (e *DeliveryEngine) setLeadershipFence(term func(queueName string) uint64, verify func(ctx context.Context, queueName string) error) {
+	e.leaderTerm = term
+	e.verifyLeader = verify
 }
 
 // Start launches the delivery loop goroutine.
@@ -196,8 +205,29 @@ func (e *DeliveryEngine) deliverQueueConfig(ctx context.Context, queueConfig *ty
 	// through the remote router, same as any remote consumer. See
 	// TestReplicatedManualStream_FollowerMustNotDeliverFromLaggingView. Same
 	// leader-only guard as cleanupStaleConsumers and runRetentionLoop.
+	//
+	// Believing it leads is not enough either. A leader that was paused or cut
+	// off keeps that belief until it hears from a peer, and meanwhile delivers
+	// from its view while the new leader delivers the same records again. The
+	// term is read before the leadership check, so a node that has already
+	// learned of a newer term cannot stamp it on a pass it no longer leads;
+	// consumers on other nodes refuse deliveries stamped with an older term than
+	// they have seen (CheckQueueDeliveryTerm), and a quorum confirms leadership
+	// before this node hands anything to its own consumers.
+	var leaderTerm uint64
+	if queueConfig.Replication.Enabled && e.leaderTerm != nil {
+		leaderTerm = e.leaderTerm(queueConfig.Name)
+	}
 	if queueConfig.Replication.Enabled && e.replicatedFollower != nil && e.replicatedFollower(queueConfig.Name) {
 		return false
+	}
+	if queueConfig.Replication.Enabled && e.verifyLeader != nil {
+		if err := e.verifyLeader(ctx, queueConfig.Name); err != nil {
+			e.logger.Debug("skipping delivery: raft leadership not confirmed",
+				slog.String("queue", queueConfig.Name),
+				slog.String("error", err.Error()))
+			return false
+		}
 	}
 
 	delivered := false
@@ -226,14 +256,14 @@ func (e *DeliveryEngine) deliverQueueConfig(ctx context.Context, queueConfig *ty
 	groups, err := e.groupStore.ListConsumerGroups(ctx, queueConfig.Name)
 	if err == nil {
 		for _, group := range groups {
-			if e.deliverToGroup(ctx, queueConfig, group, getPrimaryCommitted) {
+			if e.deliverToGroup(ctx, queueConfig, group, getPrimaryCommitted, leaderTerm) {
 				delivered = true
 			}
 		}
 	}
 
 	if e.remote != nil && e.distributionMode == DistributionForward {
-		if e.deliverToRemoteConsumers(ctx, queueConfig) {
+		if e.deliverToRemoteConsumers(ctx, queueConfig, leaderTerm) {
 			delivered = true
 		}
 	}
@@ -241,7 +271,7 @@ func (e *DeliveryEngine) deliverQueueConfig(ctx context.Context, queueConfig *ty
 	return delivered
 }
 
-func (e *DeliveryEngine) deliverToGroup(ctx context.Context, config *types.QueueConfig, group *types.ConsumerGroup, primaryCommitted func(pattern string) (uint64, bool)) bool {
+func (e *DeliveryEngine) deliverToGroup(ctx context.Context, config *types.QueueConfig, group *types.ConsumerGroup, primaryCommitted func(pattern string) (uint64, bool), leaderTerm uint64) bool {
 	if group.ConsumerCount() == 0 {
 		return false
 	}
@@ -314,7 +344,8 @@ func (e *DeliveryEngine) deliverToGroup(ctx context.Context, config *types.Queue
 			deliveries := make([]cluster.QueueDelivery, 0, len(msgs))
 			for _, msg := range msgs {
 				deliveries = append(deliveries, cluster.QueueDelivery{
-					ClientID: consumerInfo.ClientID,
+					ClientID:   consumerInfo.ClientID,
+					LeaderTerm: leaderTerm,
 					Message: createRoutedQueueMessage(
 						msg,
 						group.ID,
@@ -397,7 +428,7 @@ func (e *DeliveryEngine) deliverToGroup(ctx context.Context, config *types.Queue
 	return delivered
 }
 
-func (e *DeliveryEngine) deliverToRemoteConsumers(ctx context.Context, config *types.QueueConfig) bool {
+func (e *DeliveryEngine) deliverToRemoteConsumers(ctx context.Context, config *types.QueueConfig, leaderTerm uint64) bool {
 	consumers, err := e.remote.ListQueueConsumers(ctx, config.Name)
 	if err != nil {
 		e.logger.Debug("failed to list cluster consumers",
@@ -460,7 +491,8 @@ func (e *DeliveryEngine) deliverToRemoteConsumers(ctx context.Context, config *t
 			deliveries := make([]cluster.QueueDelivery, 0, len(msgs))
 			for _, msg := range msgs {
 				deliveries = append(deliveries, cluster.QueueDelivery{
-					ClientID: consumerInfo.ClientID,
+					ClientID:   consumerInfo.ClientID,
+					LeaderTerm: leaderTerm,
 					Message: createRoutedQueueMessage(
 						msg,
 						groupID,
@@ -630,8 +662,25 @@ func (e *DeliveryEngine) routeRemoteBatch(ctx context.Context, nodeID string, de
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, cluster.ErrStaleLeaderDelivery) {
+			// This node was deposed; the new leader delivers these.
+			return err
+		}
 		// Batch router errors may be shared across coalesced requests. Fall back
-		// so any stale-client error is tied to this exact delivery.
+		// so any stale-client error is tied to this exact delivery. A stamped
+		// delivery goes alone through the batch path, the only one that carries
+		// its term: the single-message RPC would deliver it unfenced.
+		if deliveries[0].LeaderTerm != 0 {
+			for _, delivery := range deliveries {
+				if delivery.Message == nil {
+					continue
+				}
+				if err := batchRouter.RouteQueueBatch(ctx, nodeID, []cluster.QueueDelivery{delivery}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 
 	for _, delivery := range deliveries {

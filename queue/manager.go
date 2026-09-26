@@ -387,6 +387,7 @@ func NewManager(queueStore storage.QueueStore, groupStore storage.ConsumerGroupS
 		c := mgr.coordinator()
 		return c != nil && !c.IsLeaderForQueue(queueName)
 	})
+	engine.setLeadershipFence(mgr.leaderTermForQueue, mgr.verifyLeaderForQueue)
 
 	// The facade takes ownership of what it aggregates. The core above is
 	// already complete and is not touched again.
@@ -2209,6 +2210,61 @@ func (m *Manager) EnqueueLocal(ctx context.Context, topic string, msg *message.E
 	defer message.Release(routed)
 	routed.Topic = topic
 	return m.Publish(ctx, routed)
+}
+
+// leadershipFence is implemented by a raft coordinator that can report the
+// term it has seen for a queue and confirm leadership with a quorum.
+type leadershipFence interface {
+	LeaderTermForQueue(queueName string) (uint64, bool)
+	VerifyLeaderForQueue(ctx context.Context, queueName string) error
+}
+
+// leaderVerifyTimeout bounds how long one delivery pass waits for a quorum to
+// confirm this node's leadership. The engine serves every queue from one
+// goroutine; a leader cut off from its peers must not stall the others for
+// longer than it takes raft to depose it.
+const leaderVerifyTimeout = time.Second
+
+func (m *Manager) fence() leadershipFence {
+	fence, _ := m.coordinator().(leadershipFence)
+	return fence
+}
+
+// leaderTermForQueue returns the raft term this node has seen for a replicated
+// queue, or zero when there is none to report.
+func (m *Manager) leaderTermForQueue(queueName string) uint64 {
+	fence := m.fence()
+	if fence == nil {
+		return 0
+	}
+	term, _ := fence.LeaderTermForQueue(queueName)
+	return term
+}
+
+func (m *Manager) verifyLeaderForQueue(ctx context.Context, queueName string) error {
+	fence := m.fence()
+	if fence == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, leaderVerifyTimeout)
+	defer cancel()
+	return fence.VerifyLeaderForQueue(ctx, queueName)
+}
+
+// CheckQueueDeliveryTerm implements cluster.QueueDeliveryFence: it refuses a
+// delivery claimed under a term older than the newest this node has seen for
+// the queue, which means its sender has been deposed.
+func (m *Manager) CheckQueueDeliveryTerm(queueName string, leaderTerm uint64) error {
+	fence := m.fence()
+	if fence == nil {
+		return nil
+	}
+	current, ok := fence.LeaderTermForQueue(queueName)
+	if !ok || current <= leaderTerm {
+		return nil
+	}
+	return fmt.Errorf("%w: queue %q delivery claimed in term %d, this node has seen term %d",
+		cluster.ErrStaleLeaderDelivery, queueName, leaderTerm, current)
 }
 
 // DeliverQueueMessage implements cluster.QueueHandler.DeliverQueueMessage.

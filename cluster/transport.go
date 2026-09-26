@@ -54,6 +54,25 @@ type QueueHandler interface {
 	HandleForwardedGroupOp(ctx context.Context, queueName string, op *clusterv1.GroupOperation) error
 }
 
+// ErrStaleLeaderDelivery reports a queue delivery refused because the leader
+// that claimed it has been deposed: the receiver has already seen a newer raft
+// term for the queue. The newer leader delivers the record from its own view,
+// so the sender must neither retry it nor count it as delivered.
+var ErrStaleLeaderDelivery = errors.New("queue delivery from a deposed leader")
+
+// QueueDeliveryFence is implemented by a QueueHandler that can tell whether a
+// delivery stamped with leaderTerm still comes from the current leader of a
+// replicated queue.
+//
+// A leader that was paused or partitioned keeps delivering from its own view
+// until it learns it was deposed, while the new leader delivers the same
+// records again. Every node that voted in the new term already knows it, so the
+// node the consumer is connected to refuses the stale leader's deliveries,
+// including ones that were in flight while the old leader was stopped.
+type QueueDeliveryFence interface {
+	CheckQueueDeliveryTerm(queueName string, leaderTerm uint64) error
+}
+
 // Transport handles inter-broker communication using Connect protocol.
 type Transport struct {
 	mu             sync.RWMutex
@@ -507,6 +526,13 @@ func (t *Transport) RouteQueueMessage(ctx context.Context, req *RouteQueueMessag
 			Error:   err.Error(),
 		}), nil
 	}
+	if err := checkDeliveryTerm(handler, req.Msg); err != nil {
+		message.Release(msg)
+		return connect.NewResponse(&clusterv1.RouteQueueMessageResponse{
+			Success: false,
+			Error:   err.Error(),
+		}), nil
+	}
 
 	err = handler.DeliverQueueMessage(ctx, req.Msg.ClientId, msg)
 	if err != nil {
@@ -556,6 +582,17 @@ func (t *Transport) RouteQueueBatch(ctx context.Context, req *RouteQueueBatchReq
 				ClientId:  wire.ClientId,
 				QueueName: wire.QueueName,
 				Error:     err.Error(),
+			})
+			continue
+		}
+		if err := checkDeliveryTerm(handler, wire); err != nil {
+			message.Release(msg)
+			failures = append(failures, &clusterv1.RouteQueueBatchError{
+				Index:       uint32(idx),
+				ClientId:    wire.ClientId,
+				QueueName:   wire.QueueName,
+				Error:       err.Error(),
+				StaleLeader: true,
 			})
 			continue
 		}
@@ -895,7 +932,7 @@ func (t *Transport) SendEnqueueRemote(
 func (t *Transport) SendRouteQueueMessage(ctx context.Context, nodeID, clientID string, msg *message.Envelope) error {
 	// Encode once, outside the retry: the wire form does not change between
 	// attempts, and the caller only lends msg for the duration of the call.
-	wire, err := encodeRouteQueueMessage(clientID, msg)
+	wire, err := encodeRouteQueueMessage(clientID, msg, 0)
 	if err != nil {
 		return err
 	}
@@ -1038,6 +1075,10 @@ func (t *Transport) SendRouteQueueBatch(ctx context.Context, nodeID string, deli
 		if noClientConnected(failed) {
 			break
 		}
+		// This node was deposed: every retry would be refused the same way.
+		if allStaleLeader(failed) {
+			return fmt.Errorf("%w: %s", ErrStaleLeaderDelivery, summarizeQueueBatchFailures(failed))
+		}
 
 		if attempt < maxPartialRetries-1 {
 			t.logger.Warn("route queue batch partial failure, retrying failed subset",
@@ -1061,6 +1102,18 @@ func (t *Transport) SendRouteQueueBatch(ctx context.Context, nodeID string, deli
 	return batchErr
 }
 
+func allStaleLeader(failures []queueBatchFailure) bool {
+	if len(failures) == 0 {
+		return false
+	}
+	for _, failure := range failures {
+		if !failure.staleLeader {
+			return false
+		}
+	}
+	return true
+}
+
 func noClientConnected(failures []queueBatchFailure) bool {
 	if len(failures) == 0 {
 		return false
@@ -1077,6 +1130,7 @@ type queueBatchFailure struct {
 	delivery           QueueDelivery
 	err                string
 	clientNotConnected bool
+	staleLeader        bool
 }
 
 func (t *Transport) sendRouteQueueBatchOnce(
@@ -1092,7 +1146,7 @@ func (t *Transport) sendRouteQueueBatchOnce(
 		if delivery.Message == nil {
 			continue
 		}
-		wire, err := encodeRouteQueueMessage(delivery.ClientID, delivery.Message)
+		wire, err := encodeRouteQueueMessage(delivery.ClientID, delivery.Message, delivery.LeaderTerm)
 		if err != nil {
 			return nil, err
 		}
@@ -1146,6 +1200,7 @@ func (t *Transport) sendRouteQueueBatchOnce(
 				delivery:           deliveries[deliveryIdx],
 				err:                f.Error,
 				clientNotConnected: f.ClientNotConnected,
+				staleLeader:        f.StaleLeader,
 			})
 		}
 		if len(failures) == 0 {
@@ -1350,17 +1405,32 @@ func encodedIsQoS0(encoded []byte) bool {
 	return qos == 0
 }
 
-func encodeRouteQueueMessage(clientID string, msg *message.Envelope) (*clusterv1.RouteQueueMessageRequest, error) {
+func encodeRouteQueueMessage(clientID string, msg *message.Envelope, leaderTerm uint64) (*clusterv1.RouteQueueMessageRequest, error) {
 	encoded, err := encodeEnvelope(msg)
 	if err != nil {
 		return nil, err
 	}
 	return &clusterv1.RouteQueueMessageRequest{
-		ClientId:  clientID,
-		QueueName: msg.BrokerMeta.Queue.Name,
-		Sequence:  int64(msg.BrokerMeta.Queue.Offset),
-		Envelope:  encoded,
+		ClientId:   clientID,
+		QueueName:  msg.BrokerMeta.Queue.Name,
+		Sequence:   int64(msg.BrokerMeta.Queue.Offset),
+		Envelope:   encoded,
+		LeaderTerm: leaderTerm,
 	}, nil
+}
+
+// checkDeliveryTerm refuses a delivery whose leader has been deposed, when the
+// handler can tell. An unstamped delivery (an unreplicated queue, or a sender
+// that predates the stamp) is not fenced.
+func checkDeliveryTerm(handler QueueHandler, wire *clusterv1.RouteQueueMessageRequest) error {
+	if wire.LeaderTerm == 0 {
+		return nil
+	}
+	fence, ok := handler.(QueueDeliveryFence)
+	if !ok {
+		return nil
+	}
+	return fence.CheckQueueDeliveryTerm(wire.QueueName, wire.LeaderTerm)
 }
 
 func decodeRouteQueueMessage(wire *clusterv1.RouteQueueMessageRequest) (*message.Envelope, error) {

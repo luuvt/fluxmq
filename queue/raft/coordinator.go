@@ -402,6 +402,37 @@ func (c *LogicalGroupCoordinator) IsLeaderForQueue(queueName string) bool {
 	return replicator.IsLeader(context.Background())
 }
 
+// leadershipVerifier is implemented by replicators that can report their raft
+// term and confirm leadership with a quorum (Manager does).
+type leadershipVerifier interface {
+	CurrentTerm() uint64
+	VerifyLeader(ctx context.Context) error
+}
+
+// LeaderTermForQueue returns the latest raft term this node has seen for the
+// queue's group; ok is false when the group cannot report one.
+func (c *LogicalGroupCoordinator) LeaderTermForQueue(queueName string) (uint64, bool) {
+	verifier, ok := c.replicatorForQueue(queueName).(leadershipVerifier)
+	if !ok {
+		return 0, false
+	}
+	return verifier.CurrentTerm(), true
+}
+
+// VerifyLeaderForQueue confirms with a quorum that this node still leads the
+// queue's group. A group that cannot verify is taken at its word.
+func (c *LogicalGroupCoordinator) VerifyLeaderForQueue(ctx context.Context, queueName string) error {
+	replicator := c.replicatorForQueue(queueName)
+	if replicator == nil {
+		return fmt.Errorf("no raft replicator configured for queue %q", queueName)
+	}
+	verifier, ok := replicator.(leadershipVerifier)
+	if !ok {
+		return nil
+	}
+	return verifier.VerifyLeader(ctx)
+}
+
 // LeaderForQueue returns the leader address for the queue's assigned group.
 func (c *LogicalGroupCoordinator) LeaderForQueue(queueName string) string {
 	replicator := c.replicatorForQueue(queueName)

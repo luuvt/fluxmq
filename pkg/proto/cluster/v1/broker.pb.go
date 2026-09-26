@@ -1323,7 +1323,12 @@ type RouteQueueMessageRequest struct {
 	// envelope is a complete binary message.Envelope. message_id is gone with
 	// the string map: it was a synthesized queue:offset that overwrote whatever
 	// the publisher had set, and sequence already carries the offset.
-	Envelope      []byte `protobuf:"bytes,8,opt,name=envelope,proto3" json:"envelope,omitempty"`
+	Envelope []byte `protobuf:"bytes,8,opt,name=envelope,proto3" json:"envelope,omitempty"`
+	// leader_term is the raft term of the leader that claimed this delivery of a
+	// replicated queue, zero otherwise. A receiver that has already seen a newer
+	// term refuses it: the sender was deposed, and the newer leader delivers the
+	// record from its own view.
+	LeaderTerm    uint64 `protobuf:"varint,9,opt,name=leader_term,json=leaderTerm,proto3" json:"leader_term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1384,6 +1389,13 @@ func (x *RouteQueueMessageRequest) GetEnvelope() []byte {
 		return x.Envelope
 	}
 	return nil
+}
+
+func (x *RouteQueueMessageRequest) GetLeaderTerm() uint64 {
+	if x != nil {
+		return x.LeaderTerm
+	}
+	return 0
 }
 
 type RouteQueueMessageResponse struct {
@@ -1501,8 +1513,11 @@ type RouteQueueBatchError struct {
 	// client_not_connected signals the delivery target had no live connection,
 	// so the sender can evict the stale consumer without parsing error text.
 	ClientNotConnected bool `protobuf:"varint,5,opt,name=client_not_connected,json=clientNotConnected,proto3" json:"client_not_connected,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// stale_leader signals a delivery refused because its leader_term is older
+	// than the receiver's term. Retrying cannot succeed; the sender is deposed.
+	StaleLeader   bool `protobuf:"varint,6,opt,name=stale_leader,json=staleLeader,proto3" json:"stale_leader,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RouteQueueBatchError) Reset() {
@@ -1566,6 +1581,13 @@ func (x *RouteQueueBatchError) GetError() string {
 func (x *RouteQueueBatchError) GetClientNotConnected() bool {
 	if x != nil {
 		return x.ClientNotConnected
+	}
+	return false
+}
+
+func (x *RouteQueueBatchError) GetStaleLeader() bool {
+	if x != nil {
+		return x.StaleLeader
 	}
 	return false
 }
@@ -3135,13 +3157,15 @@ const file_cluster_v1_broker_proto_rawDesc = "" +
 	"properties\"G\n" +
 	"\x15EnqueueRemoteResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"\xce\x01\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xef\x01\n" +
 	"\x18RouteQueueMessageRequest\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\tR\bclientId\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x02 \x01(\tR\tqueueName\x12\x1a\n" +
 	"\bsequence\x18\x06 \x01(\x03R\bsequence\x12\x1a\n" +
-	"\benvelope\x18\b \x01(\fR\benvelopeJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\a\x10\bR\n" +
+	"\benvelope\x18\b \x01(\fR\benvelope\x12\x1f\n" +
+	"\vleader_term\x18\t \x01(\x04R\n" +
+	"leaderTermJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\a\x10\bR\n" +
 	"message_idR\apayloadR\n" +
 	"propertiesR\x05topic\"}\n" +
 	"\x19RouteQueueMessageResponse\x12\x18\n" +
@@ -3149,14 +3173,15 @@ const file_cluster_v1_broker_proto_rawDesc = "" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x120\n" +
 	"\x14client_not_connected\x18\x03 \x01(\bR\x12clientNotConnected\"a\n" +
 	"\x16RouteQueueBatchRequest\x12G\n" +
-	"\bmessages\x18\x01 \x03(\v2+.fluxmq.cluster.v1.RouteQueueMessageRequestR\bmessages\"\xb0\x01\n" +
+	"\bmessages\x18\x01 \x03(\v2+.fluxmq.cluster.v1.RouteQueueMessageRequestR\bmessages\"\xd3\x01\n" +
 	"\x14RouteQueueBatchError\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\rR\x05index\x12\x1b\n" +
 	"\tclient_id\x18\x02 \x01(\tR\bclientId\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x03 \x01(\tR\tqueueName\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\x120\n" +
-	"\x14client_not_connected\x18\x05 \x01(\bR\x12clientNotConnected\"\xac\x01\n" +
+	"\x14client_not_connected\x18\x05 \x01(\bR\x12clientNotConnected\x12!\n" +
+	"\fstale_leader\x18\x06 \x01(\bR\vstaleLeader\"\xac\x01\n" +
 	"\x17RouteQueueBatchResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x1c\n" +

@@ -149,7 +149,7 @@ func TestDecodeRouteQueueMessageRequiresCanonicalTopic(t *testing.T) {
 
 func roundTripQueueMessage(t *testing.T, envelope *message.Envelope) *message.Envelope {
 	t.Helper()
-	wire, err := encodeRouteQueueMessage("consumer", envelope)
+	wire, err := encodeRouteQueueMessage("consumer", envelope, 0)
 	if err != nil {
 		t.Fatalf("encode queue message: %v", err)
 	}

@@ -49,4 +49,8 @@ func decodeEnvelope(encoded []byte) (*message.Envelope, error) {
 type QueueDelivery struct {
 	ClientID string
 	Message  *message.Envelope
+	// LeaderTerm is the raft term under which the sender led the replicated
+	// queue it claimed this delivery from, zero for an unreplicated queue. The
+	// receiver refuses it once it has seen a newer term (see QueueDeliveryFence).
+	LeaderTerm uint64
 }
