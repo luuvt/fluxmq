@@ -514,12 +514,13 @@ func (f *LogFSM) applyAddPending(ctx context.Context, op *Operation) *ApplyResul
 }
 
 func (f *LogFSM) applyRemovePending(ctx context.Context, op *Operation) *ApplyResult {
-	err := f.groupStore.RemovePendingEntry(ctx, op.QueueName, op.GroupID, op.ConsumerID, op.Offset)
+	owner := f.pendingOwner(ctx, op)
+	err := f.groupStore.RemovePendingEntry(ctx, op.QueueName, op.GroupID, owner, op.Offset)
 	if err != nil && !errors.Is(err, storage.ErrPendingEntryNotFound) {
 		f.logger.Error("failed to apply remove pending",
 			slog.String("queue", op.QueueName),
 			slog.String("group", op.GroupID),
-			slog.String("consumer", op.ConsumerID),
+			slog.String("consumer", owner),
 			slog.Uint64("offset", op.Offset),
 			slog.String("error", err.Error()))
 		return stopLocalFailure("remove pending", op, err)
@@ -530,6 +531,15 @@ func (f *LogFSM) applyRemovePending(ctx context.Context, op *Operation) *ApplyRe
 
 func (f *LogFSM) applyTransferPending(ctx context.Context, op *Operation) *ApplyResult {
 	err := f.groupStore.TransferPendingEntry(ctx, op.QueueName, op.GroupID, op.Offset, op.FromConsumer, op.ToConsumer)
+	if settlementRaced(err) {
+		f.logger.Warn("transfer pending skipped: entry no longer held by its sender",
+			slog.String("queue", op.QueueName),
+			slog.String("group", op.GroupID),
+			slog.Uint64("offset", op.Offset),
+			slog.String("from", op.FromConsumer),
+			slog.String("error", err.Error()))
+		return &ApplyResult{Error: err}
+	}
 	if err != nil {
 		f.logger.Error("failed to apply transfer pending",
 			slog.String("queue", op.QueueName),
@@ -549,17 +559,59 @@ func (f *LogFSM) applyRequeuePending(ctx context.Context, op *Operation) *ApplyR
 	if !ok {
 		return stopLocalFailure("requeue pending", op, storage.ErrPendingEntryNotFound)
 	}
-	if err := requeuer.RequeuePendingEntry(ctx, op.QueueName, op.GroupID, op.ConsumerID, op.Offset, op.Timestamp); err != nil {
+	owner := f.pendingOwner(ctx, op)
+	err := requeuer.RequeuePendingEntry(ctx, op.QueueName, op.GroupID, owner, op.Offset, op.Timestamp)
+	if settlementRaced(err) {
+		f.logger.Warn("requeue pending skipped: entry no longer pending",
+			slog.String("queue", op.QueueName),
+			slog.String("group", op.GroupID),
+			slog.String("consumer", owner),
+			slog.Uint64("offset", op.Offset),
+			slog.String("error", err.Error()))
+		return &ApplyResult{Error: err}
+	}
+	if err != nil {
 		f.logger.Error("failed to apply requeue pending",
 			slog.String("queue", op.QueueName),
 			slog.String("group", op.GroupID),
-			slog.String("consumer", op.ConsumerID),
+			slog.String("consumer", owner),
 			slog.Uint64("offset", op.Offset),
 			slog.String("error", err.Error()))
 		return stopLocalFailure("requeue pending", op, err)
 	}
 
 	return &ApplyResult{}
+}
+
+// pendingOwner names the consumer holding op.Offset in this replica's group
+// state, falling back to op.ConsumerID when no one does.
+//
+// A settlement proposed by a follower names the owner the follower saw, and a
+// follower learns of a commit only with the leader's next append. When a
+// transfer is the last entry before a redelivery, the new owner can settle the
+// record through a follower that has not applied the transfer yet, and the op
+// then names the previous owner. Matching on that name dropped acks silently
+// and turned nacks into a local failure on every replica. The record is what
+// a settlement is about, so it is resolved by offset here; every replica has
+// the same state at this index and resolves the same owner.
+func (f *LogFSM) pendingOwner(ctx context.Context, op *Operation) string {
+	group, err := f.groupStore.GetConsumerGroup(ctx, op.QueueName, op.GroupID)
+	if err != nil || group == nil {
+		return op.ConsumerID
+	}
+	if _, owner := group.FindPending(op.Offset); owner != "" {
+		return owner
+	}
+	return op.ConsumerID
+}
+
+// settlementRaced reports a pending-entry mutation that found the entry gone or
+// held by someone else. The proposer acted on state that changed before the op
+// was applied, a race every replica resolves identically, so it is refused like
+// any deterministic refusal rather than stopping the node (see
+// stopLocalFailure).
+func settlementRaced(err error) bool {
+	return errors.Is(err, storage.ErrPendingEntryNotFound) || errors.Is(err, storage.ErrConsumerNotFound)
 }
 
 func (f *LogFSM) applyRegisterConsumer(ctx context.Context, op *Operation) *ApplyResult {
