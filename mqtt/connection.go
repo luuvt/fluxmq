@@ -25,6 +25,7 @@ var (
 	ErrUnsupportedProtocolVersion = errors.New("unsupported MQTT protocol version")
 	ErrCannotEncodeNilPacket      = errors.New("cannot encode nil packet")
 	ErrSendQueueFull              = errors.New("send queue full")
+	ErrPacketReadStalled          = errors.New("packet read stalled")
 )
 
 const (
@@ -86,6 +87,7 @@ type connection struct {
 	// configured. Built once so the write path never allocates.
 	sock    io.Writer
 	reader  io.Reader
+	pr      packetReader  // reused by ReadPacket; only the read goroutine touches it
 	writer  *bufio.Writer // buffered writer for sendLoop; nil in sync mode
 	version int           // 0 = unknown, 3/4 = v3.1/v3.1.1, 5 = v5
 
@@ -145,6 +147,37 @@ func (w deadlineWriter) Write(p []byte) (int, error) {
 	return w.c.conn.Write(p)
 }
 
+// packetReadTimeout bounds reading the rest of a packet once its first byte
+// has arrived.
+const packetReadTimeout = 30 * time.Second
+
+// packetReader moves the read deadline out once a packet starts, so a short
+// poll deadline set by the caller cannot cut the packet and desync the stream.
+// A timeout inside a packet is ErrPacketReadStalled, not a poll timeout.
+type packetReader struct {
+	conn    net.Conn
+	r       io.Reader
+	started bool
+}
+
+func (p *packetReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if p.started {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return n, ErrPacketReadStalled
+		}
+		return n, err
+	}
+	if n > 0 {
+		p.started = true
+		if dErr := p.conn.SetReadDeadline(time.Now().Add(packetReadTimeout)); dErr != nil && err == nil {
+			err = dErr
+		}
+	}
+	return n, err
+}
+
 // NewConnection creates a new MQTT connection wrapping a network connection.
 // queueSize <= 0 keeps synchronous writes; queueSize > 0 enables asynchronous queued writes.
 func NewConnection(conn net.Conn, queueSize int, disconnectOnFull bool, opts ...ConnOption) Connection {
@@ -202,12 +235,13 @@ func (c *connection) ReadPacket() (packets.ControlPacket, error) {
 	var pkt packets.ControlPacket
 	var err error
 
+	c.pr = packetReader{conn: c.conn, r: c.reader}
 	switch c.version {
 	case 5:
-		pkt, _, _, err = v5.ReadPacketLimit(c.reader, c.maxPacketSize)
+		pkt, _, _, err = v5.ReadPacketLimit(&c.pr, c.maxPacketSize)
 	case 3, 4:
 		// v4 is MQTT 3.1.1, v3 is MQTT 3.1
-		pkt, err = v3.ReadPacketLimit(c.reader, c.maxPacketSize)
+		pkt, err = v3.ReadPacketLimit(&c.pr, c.maxPacketSize)
 	default:
 		err = ErrUnsupportedProtocolVersion
 	}

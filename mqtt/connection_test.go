@@ -253,6 +253,29 @@ func TestConnectionReadWriteDeadline(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestConnectionReadDeadlineDoesNotSplitPacket(t *testing.T) {
+	serverConn, clientConn := createMockTCPConnection(t)
+	conn := core.NewConnectionWithVersion(serverConn, 0, false, core.ProtocolV3)
+
+	// Nothing sent: the short deadline is still a plain poll timeout.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err := conn.ReadPacket()
+	var netErr net.Error
+	require.ErrorAs(t, err, &netErr)
+	require.True(t, netErr.Timeout())
+
+	// The deadline passes between a PINGREQ's two bytes.
+	go func() {
+		_, _ = clientConn.Write([]byte{0xC0})
+		time.Sleep(150 * time.Millisecond)
+		_, _ = clientConn.Write([]byte{0x00})
+	}()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	pkt, err := conn.ReadPacket()
+	require.NoError(t, err)
+	assert.Equal(t, byte(v3.PingReqType), pkt.Type())
+}
+
 func TestConnectionAddresses(t *testing.T) {
 	serverConn, _ := createMockTCPConnection(t)
 
