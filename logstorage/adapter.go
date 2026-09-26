@@ -624,9 +624,15 @@ func (a *Adapter) RemovePendingEntry(ctx context.Context, queueName, groupID, co
 		return err
 	}
 
-	// Update the group state's PEL as well
+	// Update the group state's PEL as well. The store above settles by offset
+	// whoever holds it, so the group state has to drop the same entry: removing
+	// it under consumerID alone left a stream group, whose pending list is not
+	// resynced from the store, still showing the record held by its real owner.
 	group, err := a.groupStore.Get(queueName, groupID)
 	if err == nil {
+		if _, owner := group.FindPending(offset); owner != "" {
+			consumerID = owner
+		}
 		group.RemovePending(consumerID, offset)
 		if err := a.groupStore.Save(group); err != nil {
 			return err
@@ -671,6 +677,17 @@ func (a *Adapter) GetAllPendingEntries(ctx context.Context, queueName, groupID s
 
 // TransferPendingEntry moves a pending entry from one consumer to another.
 func (a *Adapter) TransferPendingEntry(ctx context.Context, queueName, groupID string, offset uint64, fromConsumer, toConsumer string) error {
+	// The store claims by offset alone and accepts one it does not hold, while
+	// the group state moves the entry only from fromConsumer. Checked first, so
+	// a transfer either happens in both or is refused, as the memory store does.
+	current, err := a.GetConsumerGroup(ctx, queueName, groupID)
+	if err != nil {
+		return err
+	}
+	if _, owner := current.FindPending(offset); owner != fromConsumer {
+		return storage.ErrPendingEntryNotFound
+	}
+
 	if err := a.store.ClaimPending(queueName, groupID, offset, toConsumer); err != nil {
 		if errors.Is(err, ErrPELEntryNotFound) {
 			return storage.ErrPendingEntryNotFound

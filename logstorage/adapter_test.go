@@ -418,3 +418,58 @@ func TestAdapterReportsPersistedFiltersThatCannotMatch(t *testing.T) {
 		t.Fatalf("FindMatchingQueues = %v, want [legacy]", matched)
 	}
 }
+
+func newManualStreamAdapter(t *testing.T, owner string) *Adapter {
+	t.Helper()
+
+	adapter, err := NewAdapter(t.TempDir(), DefaultAdapterConfig())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = adapter.Close() })
+
+	ctx := context.Background()
+	require.NoError(t, adapter.CreateQueue(ctx, types.DefaultQueueConfig("manual", "manual/#")))
+	group := types.NewConsumerGroupState("manual", "workers", "")
+	group.Mode = types.GroupModeStream
+	group.AutoCommit = false
+	require.NoError(t, adapter.CreateConsumerGroup(ctx, group))
+	require.NoError(t, adapter.AddPendingEntry(ctx, "manual", "workers", &types.PendingEntry{
+		Offset: 3, ConsumerID: owner, ClaimedAt: time.Now(), DeliveryCount: 1,
+	}))
+	return adapter
+}
+
+// The offset-keyed store settles whoever holds the offset, so the group state
+// must drop the same entry. Removing it only under the named consumer left a
+// stream group, whose pending list is never resynced from the store, showing a
+// record the store had already settled.
+func TestAdapterRemovePendingKeepsGroupStateInStepWithStore(t *testing.T) {
+	adapter := newManualStreamAdapter(t, "consumer-new")
+
+	require.NoError(t, adapter.RemovePendingEntry(context.Background(), "manual", "workers", "consumer-old", 3))
+
+	group, err := adapter.GetConsumerGroup(context.Background(), "manual", "workers")
+	require.NoError(t, err)
+	_, owner := group.FindPending(3)
+	assert.Empty(t, owner)
+	assert.Zero(t, group.PendingCount())
+}
+
+// A transfer from a consumer that does not hold the entry is refused before
+// either copy changes; the store's claim alone would have taken it.
+func TestAdapterTransferPendingRefusesWrongSender(t *testing.T) {
+	adapter := newManualStreamAdapter(t, "consumer-new")
+	ctx := context.Background()
+
+	err := adapter.TransferPendingEntry(ctx, "manual", "workers", 3, "consumer-old", "consumer-other")
+	require.ErrorIs(t, err, storage.ErrPendingEntryNotFound)
+	err = adapter.TransferPendingEntry(ctx, "manual", "workers", 99, "consumer-new", "consumer-other")
+	require.ErrorIs(t, err, storage.ErrPendingEntryNotFound)
+
+	group, err := adapter.GetConsumerGroup(ctx, "manual", "workers")
+	require.NoError(t, err)
+	_, owner := group.FindPending(3)
+	assert.Equal(t, "consumer-new", owner)
+	moved, err := adapter.GetPendingEntries(ctx, "manual", "workers", "consumer-other")
+	require.NoError(t, err)
+	assert.Empty(t, moved)
+}
