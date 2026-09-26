@@ -135,6 +135,11 @@ type Config struct {
 	// Zero means commit on every delivery batch.
 	AutoCommitInterval time.Duration
 
+	// HeartbeatRefresh skips a heartbeat write while the recorded one is younger
+	// than this (each write is a raft entry on a replicated queue). Zero writes
+	// every time.
+	HeartbeatRefresh time.Duration
+
 	// MaxPELSize is the maximum number of pending entries per consumer group.
 	// When reached, new claims are rejected until entries are acknowledged.
 	// Zero means unlimited (not recommended for production).
@@ -1773,10 +1778,19 @@ func (m *Manager) UpdateHeartbeat(ctx context.Context, queueName, groupID, consu
 		return err
 	}
 
+	now := time.Now()
+	current, ok := group.GetConsumer(consumerID)
+	if !ok {
+		return ErrConsumerNotFound
+	}
+	if m.config.HeartbeatRefresh > 0 && now.Sub(current.LastHeartbeat) < m.config.HeartbeatRefresh {
+		return nil
+	}
+
 	// Through the group's lock: the heartbeat used to be written through a
 	// pointer GetConsumer handed out, with nothing serialising it against the
 	// encoder that persists the group.
-	consumer, ok := group.TouchConsumer(consumerID, time.Now())
+	consumer, ok := group.TouchConsumer(consumerID, now)
 	if !ok {
 		return ErrConsumerNotFound
 	}

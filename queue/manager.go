@@ -351,6 +351,7 @@ func NewManager(queueStore storage.QueueStore, groupStore storage.ConsumerGroupS
 		ClaimBatchSize:     config.ClaimBatchSize,
 		StealBatchSize:     5,
 		AutoCommitInterval: config.AutoCommitInterval,
+		HeartbeatRefresh:   heartbeatRefresh(config.HeartbeatInterval, config.ConsumerTimeout),
 		MaxPELSize:         config.MaxPELSize,
 		OnDLQ: func(ctx context.Context, queueName, groupID string, msg *message.Envelope, offset uint64, deliveryCount int, reason string) error {
 			return records.moveToDLQ(ctx, queueName, groupID, msg, offset, deliveryCount, reason, dlqPrefix)
@@ -2210,6 +2211,16 @@ func (m *Manager) EnqueueLocal(ctx context.Context, topic string, msg *message.E
 	defer message.Release(routed)
 	routed.Topic = topic
 	return m.Publish(ctx, routed)
+}
+
+// heartbeatRefresh is half the touch interval, capped at a quarter of the
+// consumer timeout.
+func heartbeatRefresh(interval, timeout time.Duration) time.Duration {
+	refresh := interval / 2
+	if timeout > 0 && (refresh <= 0 || refresh > timeout/4) {
+		refresh = timeout / 4
+	}
+	return refresh
 }
 
 // leadershipFence is implemented by a raft coordinator that can report the

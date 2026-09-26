@@ -127,3 +127,18 @@ func TestTouchLiveLocalConsumers_SkipsRemoteConsumer(t *testing.T) {
 			info.ProxyNodeID, consumerInfo.LastHeartbeat, staleHeartbeat)
 	}
 }
+
+func TestHeartbeatRefreshStaysWellInsideConsumerTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		interval, timeout, want time.Duration
+	}{
+		{10 * time.Second, 2 * time.Minute, 5 * time.Second},
+		{10 * time.Second, 100 * time.Millisecond, 25 * time.Millisecond},
+		{0, 2 * time.Minute, 30 * time.Second},
+		{10 * time.Second, 0, 5 * time.Second},
+	} {
+		if got := heartbeatRefresh(tc.interval, tc.timeout); got != tc.want {
+			t.Fatalf("heartbeatRefresh(%v, %v) = %v, want %v", tc.interval, tc.timeout, got, tc.want)
+		}
+	}
+}
