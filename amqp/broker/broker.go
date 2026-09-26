@@ -323,7 +323,7 @@ func (b *Broker) Publish(ctx context.Context, topic string, payload []byte, prop
 				continue
 			}
 			c := val.(*Connection)
-			c.deliverMessage(topic, payload, props)
+			_ = c.deliverMessage(topic, payload, props) // pub/sub is best effort
 			continue
 		}
 		if b.crossDeliver != nil {
@@ -379,7 +379,7 @@ func (b *Broker) ForwardPublish(ctx context.Context, msg *message.Envelope) erro
 		if c.connectionPolicy().carriesReservedProperties() {
 			projection = message.TrustedServiceProjection
 		}
-		c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection))
+		_ = c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection)) // pub/sub is best effort
 	}
 
 	return nil
@@ -401,8 +401,7 @@ func (b *Broker) DeliverToClient(ctx context.Context, clientID string, msg *mess
 	if c.connectionPolicy().carriesReservedProperties() {
 		projection = message.TrustedServiceProjection
 	}
-	c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection))
-	return nil
+	return c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection))
 }
 
 // DeliverToClusterMessage delivers a message routed from another cluster node to a local AMQP 0.9.1 client.
@@ -419,8 +418,7 @@ func (b *Broker) DeliverToClusterMessage(ctx context.Context, clientID string, m
 	if c.connectionPolicy().carriesReservedProperties() {
 		projection = message.TrustedServiceProjection
 	}
-	c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection))
-	return nil
+	return c.deliverMessage(msg.Topic, msg.PayloadBytes(), message.ProjectProperties(msg, projection))
 }
 
 // CancelConsumers sends server-initiated basic.cancel frames for consumers
@@ -468,5 +466,5 @@ func (b *Broker) LocalDeliverPubSub(ctx context.Context, clientID string, topic 
 	if !ok {
 		return
 	}
-	val.(*Connection).deliverMessage(topic, payload, props)
+	_ = val.(*Connection).deliverMessage(topic, payload, props) // pub/sub is best effort
 }
