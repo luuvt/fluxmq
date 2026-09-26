@@ -701,12 +701,31 @@ func (c *Connection) getChannel(chID uint16) *Channel {
 }
 
 // deliverMessage delivers a message to all channels that have matching consumers.
-func (c *Connection) deliverMessage(topic string, payload []byte, props map[string]string) {
+// deliverMessage reports ErrClientNotConnected when no consumer on this
+// connection took the message, so a queue sender does not count it delivered.
+func (c *Connection) deliverMessage(topic string, payload []byte, props map[string]string) error {
+	if c.closed.Load() {
+		return fmt.Errorf("%w: connection closing", corebroker.ErrClientNotConnected)
+	}
 	c.channelsMu.RLock()
 	defer c.channelsMu.RUnlock()
 
+	delivered := false
+	var sendErr error
 	for _, ch := range c.channels {
-		ch.deliverMessage(topic, payload, props)
+		ok, err := ch.deliverMessage(topic, payload, props)
+		delivered = delivered || ok
+		if err != nil {
+			sendErr = err
+		}
+	}
+	switch {
+	case delivered:
+		return nil
+	case sendErr != nil:
+		return fmt.Errorf("%w: %v", corebroker.ErrClientNotConnected, sendErr)
+	default:
+		return fmt.Errorf("%w: no consumer on this connection for %s", corebroker.ErrClientNotConnected, topic)
 	}
 }
 

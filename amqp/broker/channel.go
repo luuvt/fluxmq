@@ -1778,9 +1778,11 @@ func (ch *Channel) rejectDelivery(ud *unackedDelivery) {
 }
 
 // deliverMessage delivers a message to all consumers on this channel whose queue matches the topic.
-func (ch *Channel) deliverMessage(topic string, payload []byte, props map[string]string) {
+// deliverMessage reports whether a consumer on this channel took the message
+// (sent or queued behind its prefetch window).
+func (ch *Channel) deliverMessage(topic string, payload []byte, props map[string]string) (bool, error) {
 	if ch.closed.Load() {
-		return
+		return false, nil
 	}
 
 	ch.consumersMu.RLock()
@@ -1790,6 +1792,7 @@ func (ch *Channel) deliverMessage(topic string, payload []byte, props map[string
 	}
 	ch.consumersMu.RUnlock()
 
+	delivered := false
 	for _, cons := range consumers {
 		if !ch.consumerQueueMatches(cons, topic) {
 			continue
@@ -1797,14 +1800,17 @@ func (ch *Channel) deliverMessage(topic string, payload []byte, props map[string
 
 		if ch.shouldQueueDelivery(cons) {
 			ch.enqueueDelivery(cons, topic, payload, props)
+			delivered = true
 			continue
 		}
 
 		if err := ch.sendDelivery(cons, topic, payload, props); err != nil {
 			ch.conn.logger.Error("failed to deliver message", "error", err)
-			return
+			return delivered, err
 		}
+		delivered = true
 	}
+	return delivered, nil
 }
 
 // consumerQueueMatches checks if a consumer's queue matches the given topic.
