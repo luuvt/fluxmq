@@ -513,7 +513,14 @@ func (m *Manager) ApplyWithOptions(ctx context.Context, op *Operation, opts Appl
 		return nil, fmt.Errorf("not leader, leader is at %s", leaderAddr)
 	}
 
-	op.Timestamp = time.Now()
+	// Entries carry the leader's clock, except a requeue: its timestamp is the
+	// payload, the moment the entry becomes due again. Overwriting it made a
+	// nack due one visibility timeout from now instead of immediately, so a
+	// nacked record on a replicated queue waited out the full lease, and a
+	// delayed nack ignored its delay.
+	if op.Type != OpRequeuePending || op.Timestamp.IsZero() {
+		op.Timestamp = time.Now()
+	}
 
 	data, err := marshalOperation(op)
 	if err != nil {
