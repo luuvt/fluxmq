@@ -24,6 +24,7 @@ import (
 	clusterv1 "github.com/absmach/fluxmq/pkg/proto/cluster/v1"
 	"github.com/absmach/fluxmq/storage"
 	"github.com/absmach/fluxmq/topics"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	etcdtransport "go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -2779,38 +2780,61 @@ func (c *EtcdCluster) pruneOrphanedSubscriptions() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := c.client.Get(ctx, subscriptionsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	subs, err := c.client.Get(ctx, subscriptionsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
 	if err != nil {
 		c.logger.Warn("pruneOrphanedSubscriptions: list subscriptions failed", slog.String("error", err.Error()))
 		return
 	}
+	// One range read instead of a Get per client: listed after subs, so a
+	// client missing here had no owner when its entry was listed or lost it since.
+	owners, err := c.client.Get(ctx, sessionsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		c.logger.Warn("pruneOrphanedSubscriptions: list session owners failed", slog.String("error", err.Error()))
+		return
+	}
+	owned := make(map[string]struct{}, len(owners.Kvs))
+	for _, kv := range owners.Kvs {
+		if clientID, ok := parseSessionOwnerKey(string(kv.Key)); ok {
+			owned[clientID] = struct{}{}
+		}
+	}
 
-	pruned := 0
-	for _, kv := range resp.Kvs {
-		clientID := strings.TrimPrefix(string(kv.Key), subscriptionsPrefix)
-		if clientID == "" {
-			continue
-		}
-		owner, ok, err := c.GetSessionOwner(ctx, clientID)
-		if err != nil {
-			c.logger.Warn("pruneOrphanedSubscriptions: GetSessionOwner failed",
-				slog.String("client_id", clientID), slog.String("error", err.Error()))
-			continue
-		}
-		if ok && owner != "" {
-			continue
-		}
-		if err := c.RemoveAllSubscriptions(ctx, clientID); err != nil {
-			c.logger.Warn("pruneOrphanedSubscriptions: remove failed",
-				slog.String("client_id", clientID), slog.String("error", err.Error()))
-			continue
-		}
-		pruned++
+	pruned, err := c.pruneSubscriptionEntries(ctx, subs.Kvs, owned)
+	if err != nil {
+		c.logger.Warn("pruneOrphanedSubscriptions: remove failed", slog.String("error", err.Error()))
 	}
 	if pruned > 0 {
 		c.logger.Info("pruneOrphanedSubscriptions: removed stale subscriptions with no live session owner",
 			slog.Int("count", pruned))
 	}
+}
+
+// pruneSubscriptionEntries deletes the listed entries whose client is not in
+// owned. Each delete holds only if the entry is unchanged and still has no
+// owner, so a client that reconnected after the listing keeps its entry.
+func (c *EtcdCluster) pruneSubscriptionEntries(ctx context.Context, subs []*mvccpb.KeyValue, owned map[string]struct{}) (int, error) {
+	pruned := 0
+	for _, kv := range subs {
+		key := string(kv.Key)
+		clientID := strings.TrimPrefix(key, subscriptionsPrefix)
+		if clientID == "" {
+			continue
+		}
+		if _, ok := owned[clientID]; ok {
+			continue
+		}
+		resp, err := c.client.Txn(ctx).If(
+			clientv3.Compare(clientv3.ModRevision(key), "=", kv.ModRevision),
+			clientv3.Compare(clientv3.CreateRevision(sessionOwnerKey(clientID)), "=", 0),
+		).Then(clientv3.OpDelete(key)).Commit()
+		if err != nil {
+			return pruned, fmt.Errorf("client %q: %w", clientID, err)
+		}
+		if resp.Succeeded {
+			pruned++
+		}
+	}
+	return pruned, nil
 }
 
 // selfHealLeasedKeys re-registers tracked leased keys that are missing from
