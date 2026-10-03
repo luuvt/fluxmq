@@ -172,10 +172,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create raft directory: %w", err)
 	}
 
-	// Open BadgerDB for Raft log and metadata
-	opts := badger.DefaultOptions(raftDir)
-	opts.Logger = nil
-	raftDB, err := badger.Open(opts)
+	// Raft must not report a committed entry while its log or stable metadata
+	// exists only in the page cache. Both stores share this DB.
+	raftDB, err := badger.Open(raftBadgerOptions(raftDir))
 	if err != nil {
 		return fmt.Errorf("failed to open raft badger db: %w", err)
 	}
@@ -201,10 +200,9 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// Create FSM that handles all queues
 	m.fsm = NewLogFSM(m.groupID(), m.queueStore, m.groupStore, m.logger)
-
-	if err := m.resetForLogReplay(ctx); err != nil {
-		raftDB.Close()
-		return err
+	if err := m.prepareFSMForRecovery(ctx); err != nil {
+		_ = raftDB.Close()
+		return fmt.Errorf("failed to prepare raft state machine recovery: %w", err)
 	}
 
 	// Create transport
@@ -263,44 +261,52 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// resetForLogReplay clears this group's queues when raft is about to rebuild
-// them from the log alone.
+func raftBadgerOptions(dir string) badger.Options {
+	opts := badger.DefaultOptions(dir).WithSyncWrites(true)
+	opts.Logger = nil
+	return opts
+}
+
+// prepareFSMForRecovery keeps the disk-backed queue state from being applied
+// twice after a process restart. Hashicorp Raft restores a snapshot when one
+// exists; Restore replaces this group's state before replaying newer entries.
+// Without a snapshot, it replays the log over the queue store as it stands, so
+// empty this group's queues first. Their configurations stay, because a queue
+// declared in the broker's configuration never passes through the log. No other
+// group's queues or local-only queues are touched.
 //
-// hashicorp/raft treats the FSM as volatile: on start it restores the newest
-// snapshot and then applies every committed entry after it. Restore discards
-// local state before laying the snapshot down, but with no snapshot nothing
-// does, and the queue store here is durable — the log would be replayed on top
-// of the records the previous run already wrote, appending each one again and
-// pointing cursors at the copies.
-//
-// Without a snapshot the log has never been compacted, so it still holds every
-// entry from the first and the replay rebuilds the whole state. A log that
-// starts later with no snapshot to cover the gap cannot be rebuilt, and
-// starting over it would serve a queue missing its head.
-func (m *Manager) resetForLogReplay(ctx context.Context) error {
+// Until the replay catches up, this group's queues read as empty on this node.
+func (m *Manager) prepareFSMForRecovery(ctx context.Context) error {
 	snapshots, err := m.snapshotStore.List()
 	if err != nil {
-		return fmt.Errorf("failed to list raft snapshots: %w", err)
+		return fmt.Errorf("list raft snapshots: %w", err)
 	}
 	if len(snapshots) > 0 {
 		return nil
 	}
 
-	first, err := m.raftLogStore.FirstIndex()
+	hasState, err := raft.HasExistingState(m.raftLogStore, m.stableStore, m.snapshotStore)
 	if err != nil {
-		return fmt.Errorf("failed to read first raft log index: %w", err)
+		return fmt.Errorf("check existing raft state: %w", err)
 	}
-	if first > 1 {
-		return fmt.Errorf("raft log starts at index %d but no snapshot covers the entries before it", first)
+	if !hasState {
+		return nil
 	}
 
-	dropped, err := m.fsm.resetForReplay(ctx)
+	first, err := m.raftLogStore.FirstIndex()
 	if err != nil {
-		return err
+		return fmt.Errorf("read first raft log index: %w", err)
 	}
-	if len(dropped) > 0 {
-		m.logger.Info("cleared replicated queues to rebuild them from the raft log",
-			slog.Any("queues", dropped))
+	if first > 1 {
+		return fmt.Errorf("raft log begins at index %d without a snapshot", first)
+	}
+
+	snapshotable, ok := m.queueStore.(storage.SnapshotableQueueStore)
+	if !ok {
+		return fmt.Errorf("queue store cannot be rebuilt from raft log: %T", m.queueStore)
+	}
+	if err := m.fsm.resetForReplay(ctx, snapshotable); err != nil {
+		return fmt.Errorf("clear materialized raft group state: %w", err)
 	}
 	return nil
 }
@@ -467,6 +473,15 @@ func (m *Manager) Stop() error {
 
 	m.logger.Info("raft manager stopped")
 	return nil
+}
+
+// IsQueueConfigRecorded reports whether the queue's settings have been applied
+// from this group's Raft state on this node.
+func (m *Manager) IsQueueConfigRecorded(queueName string) bool {
+	if m.fsm == nil {
+		return false
+	}
+	return m.fsm.IsQueueConfigRecorded(queueName)
 }
 
 // IsEnabled returns true if Raft replication is enabled.
@@ -719,6 +734,14 @@ func (m *Manager) ApplyAppendOnceWithOptions(ctx context.Context, queueName, ded
 	return result.Offset, result.Deduplicated, nil
 }
 
+// applyQueueMetadata applies a queue settings operation and waits for its
+// commit. Callers report success or retry on the answer, and an async apply
+// returns before either exists, so async mode is overridden rather than honoured.
+func (m *Manager) applyQueueMetadata(ctx context.Context, op *Operation) (*ApplyResult, error) {
+	syncMode := true
+	return m.ApplyWithOptions(ctx, op, ApplyOptions{SyncMode: &syncMode})
+}
+
 // ApplyCreateQueue submits a create queue config operation to Raft.
 func (m *Manager) ApplyCreateQueue(ctx context.Context, cfg types.QueueConfig) error {
 	if !m.IsEnabled() {
@@ -732,7 +755,7 @@ func (m *Manager) ApplyCreateQueue(ctx context.Context, cfg types.QueueConfig) e
 		QueueConfig: &cfgCopy,
 	}
 
-	result, err := m.Apply(ctx, op)
+	result, err := m.applyQueueMetadata(ctx, op)
 	if err != nil {
 		return err
 	}
@@ -756,7 +779,7 @@ func (m *Manager) ApplyUpdateQueue(ctx context.Context, cfg types.QueueConfig) e
 		QueueConfig: &cfgCopy,
 	}
 
-	result, err := m.Apply(ctx, op)
+	result, err := m.applyQueueMetadata(ctx, op)
 	if err != nil {
 		return err
 	}
@@ -778,7 +801,7 @@ func (m *Manager) ApplyDeleteQueue(ctx context.Context, queueName string) error 
 		QueueName: queueName,
 	}
 
-	result, err := m.Apply(ctx, op)
+	result, err := m.applyQueueMetadata(ctx, op)
 	if err != nil {
 		return err
 	}
