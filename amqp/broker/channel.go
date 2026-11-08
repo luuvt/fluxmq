@@ -40,6 +40,12 @@ type consumer struct {
 	groupID    string
 	noAck      bool
 	exclusive  bool
+	// autoCommitStream: group stream auto-commit, ack/nack không còn tác dụng (nil = không).
+	autoCommitStream *atomic.Bool
+}
+
+func (c *consumer) isAutoCommitStream() bool {
+	return c.autoCommitStream != nil && c.autoCommitStream.Load()
 }
 
 type queueInfo struct {
@@ -91,6 +97,8 @@ type Channel struct {
 	// Unacked deliveries for manual ack mode
 	unacked   map[uint64]*unackedDelivery
 	unackedMu sync.Mutex
+	// autoCommitTags: tag của delivery auto-commit, chỉ giữ maxAutoCommitUnacked tag mới nhất.
+	autoCommitTags []uint64
 
 	// Flow control
 	flow bool
@@ -113,6 +121,9 @@ type Channel struct {
 	serverClosing atomic.Bool
 	closed        atomic.Bool
 }
+
+// maxAutoCommitUnacked giới hạn tag auto-commit giữ lại khi không có prefetch.
+const maxAutoCommitUnacked = 4096
 
 type unackedDelivery struct {
 	deliveryTag uint64
@@ -938,6 +949,16 @@ func (ch *Channel) drainPending() {
 	}
 }
 
+// trimAutoCommitLocked bỏ tag auto-commit cũ nhất; client không ack thì map không phình. Gọi khi giữ unackedMu.
+func (ch *Channel) trimAutoCommitLocked(tag uint64) {
+	ch.autoCommitTags = append(ch.autoCommitTags, tag)
+	if len(ch.autoCommitTags) <= maxAutoCommitUnacked {
+		return
+	}
+	delete(ch.unacked, ch.autoCommitTags[0])
+	ch.autoCommitTags = ch.autoCommitTags[1:]
+}
+
 func (ch *Channel) sendDelivery(cons *consumer, topic string, payload []byte, props map[string]string) error {
 	deliveryTag := ch.conn.nextDeliveryTag()
 
@@ -951,6 +972,9 @@ func (ch *Channel) sendDelivery(cons *consumer, topic string, payload []byte, pr
 			groupID:     props[message.PropertyGroupID],
 			offset:      offset,
 			queued:      queued,
+		}
+		if cons.isAutoCommitStream() && ch.prefetchCount == 0 {
+			ch.trimAutoCommitLocked(deliveryTag)
 		}
 		ch.unackedMu.Unlock()
 	}
@@ -1496,6 +1520,8 @@ func (ch *Channel) handleBasicConsume(m *codec.BasicConsume) error {
 		groupID:    groupID,
 		noAck:      m.NoAck,
 		exclusive:  m.Exclusive,
+
+		autoCommitStream: new(atomic.Bool),
 	}
 
 	ch.consumersMu.Lock()
@@ -1574,6 +1600,12 @@ func (ch *Channel) handleBasicConsume(m *codec.BasicConsume) error {
 		} else {
 			subscriptionStarted = true
 			subscribeErr = qm.Subscribe(context.Background(), queueName, pattern, clientID, subGroupID, "")
+		}
+
+		if subscribeErr == nil && isStream {
+			if ac, ok := qm.(streamAutoCommitReader); ok {
+				cons.autoCommitStream.Store(ac.StreamGroupAutoCommit(context.Background(), queueName, subGroupID, pattern))
+			}
 		}
 
 		if subscribeErr != nil {
@@ -2344,6 +2376,11 @@ func parseStringArg(val any) (string, bool) {
 		return strings.TrimSpace(string(v)), true
 	}
 	return "", false
+}
+
+// streamAutoCommitReader cho biết group stream có đang auto-commit không.
+type streamAutoCommitReader interface {
+	StreamGroupAutoCommit(ctx context.Context, queueName, groupID, pattern string) bool
 }
 
 func extractAutoCommit(args map[string]any) *bool {
