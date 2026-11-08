@@ -431,6 +431,7 @@ func warnListenerScopedBinding(cfg *config.Config, logger *slog.Logger) {
 }
 
 func main() {
+	startPprof()
 	configFile := flag.String("config", "", "Path to configuration file")
 	configOptional := flag.Bool("config-optional", false,
 		"Fall back to built-in defaults when --config names a file that does not exist")
