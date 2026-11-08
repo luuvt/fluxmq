@@ -1489,6 +1489,15 @@ func matchesTopic(filter, topic string) bool {
 // --- Subscribe Operations ---
 
 // SubscribeWithCursor adds a consumer with explicit cursor positioning.
+// StreamGroupAutoCommit báo group stream (theo groupID+pattern) có bật auto-commit; lỗi = false.
+func (m *Manager) StreamGroupAutoCommit(ctx context.Context, queueName, groupID, pattern string) bool {
+	group, err := m.groupStore.GetConsumerGroup(ctx, queueName, corebroker.EffectiveConsumerGroupID(groupID, pattern))
+	if err != nil || group == nil {
+		return false
+	}
+	return group.Mode == types.GroupModeStream && group.AutoCommitEnabled()
+}
+
 func (m *Manager) SubscribeWithCursor(ctx context.Context, queueName, pattern string, clientID, groupID, proxyNodeID string, cursor *types.CursorOption) error {
 	return m.subscribeWithCursor(ctx, queueName, pattern, clientID, groupID, proxyNodeID, cursor, true)
 }
