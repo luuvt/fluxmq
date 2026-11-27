@@ -29,7 +29,7 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.1
+          version: v2.14.0
 
   test-build:
     runs-on: ubuntu-latest
@@ -66,8 +66,16 @@ jobs:
       - name: Verify protobuf is up to date
         run: git diff --exit-code
 
+      # tests/interop checks wire compatibility against the Mosquitto clients
+      # and skips without them.
+      - name: Install Mosquitto clients
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mosquitto-clients
+
       - name: Run tests
         run: make test
+
+      - name: Run allocation guards
+        run: make test-allocs
 
       - name: Build
         run: make build

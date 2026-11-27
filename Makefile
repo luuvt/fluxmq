@@ -147,6 +147,21 @@ docker-cluster-down:
 test:
 	$(GO) test -short -race -failfast -timeout 3m -v ./...
 
+# Fuzz every target whose package or in-module dependencies changed since BASE
+# (all targets when BASE is empty or go.mod changed). Seed corpora also run as
+# ordinary tests under `make test`.
+FUZZTIME ?= 30s
+.PHONY: fuzz
+fuzz:
+	BASE="$(BASE)" FUZZTIME="$(FUZZTIME)" ./scripts/fuzz_changed.sh
+
+# Allocation guards (internal/allocguard) skip under the race detector, which
+# changes allocation counts, so `make test` never runs them. Run them without it.
+ALLOC_GUARD_PKGS = $(sort $(dir $(shell grep -rl --include='*_test.go' 'fluxmq/internal/allocguard' .)))
+.PHONY: test-allocs
+test-allocs:
+	$(GO) test -count=1 -run 'Allocs' $(ALLOC_GUARD_PKGS)
+
 # Run client package unit tests (MQTT + AMQP 0.9.1 client packages).
 .PHONY: test-client
 test-client:

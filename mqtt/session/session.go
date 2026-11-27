@@ -103,10 +103,10 @@ type Session struct {
 	// negotiated Receive Maximum is clamped to it on every (re)connect.
 	serverMaxInflight int
 
-	// pendingCh buffers messages that exceeded the send quota.
+	// pending buffers messages that exceeded the send quota.
 	// Non-nil only when InflightOverflow == InflightOverflowQueue.
 	// Drained into inflight as ACKs arrive; spilled to offline on disconnect.
-	pendingCh chan pendingItem
+	pending *pendingQueue
 
 	// deliverStop is closed when the session disconnects to unblock goroutines
 	// waiting on the send window.
@@ -199,16 +199,15 @@ func New(clientID string, version byte, opts Options, inflight messages.Inflight
 	// epoch on (re)connect.
 	s.sendWindow = newSendWindow(int(receiveMax), 0, backpressure)
 
-	switch sessionCfg.InflightOverflow {
-	case config.InflightOverflowBackpressure:
-		// Send quota provides the backpressure; no pending queue.
-	case config.InflightOverflowQueue:
-		pendingCap := sessionCfg.PendingQueueSize
-		if pendingCap <= 0 {
-			pendingCap = 1000
-		}
-		s.pendingCh = make(chan pendingItem, pendingCap)
+	// Queue mode overflows into the pending queue. Backpressure mode uses it
+	// too, for deliveries that must not wait: a delivery made on a
+	// connection's read loop would stop that loop from reading the
+	// acknowledgements that free the quota.
+	pendingCap := sessionCfg.PendingQueueSize
+	if pendingCap <= 0 {
+		pendingCap = 1000
 	}
+	s.pending = newPendingQueue(pendingCap)
 
 	return s
 }
@@ -587,6 +586,11 @@ func (s *Session) ReleaseSendQuota(packetID uint16, gen uint64) {
 	s.sendWindow.release(packetID, gen)
 }
 
+// HasSendQuota reports whether generation gen has a send-quota token free.
+func (s *Session) HasSendQuota(gen uint64) bool {
+	return s.sendWindow.hasRoom(gen)
+}
+
 // AddInbound atomically admits an inbound QoS 2 transaction. accepted reports
 // whether the tracker took ownership of msg. Trackers that do not implement the
 // optional directional extension are rejected explicitly because their base
@@ -634,75 +638,49 @@ func (s *Session) MarkSentIfEpoch(packetID uint16, gen uint64) {
 }
 
 // TryEnqueuePending attempts to push an overflow item into the pending queue.
-// Returns true on success, false if the pending queue is also full (caller drops).
-// Only meaningful when pendingCh is non-nil (pending queue mode).
+// Returns true on success, false if the pending queue is also full.
 func (s *Session) TryEnqueuePending(msg *message.Envelope, onSent func()) bool {
-	if s.pendingCh == nil {
-		return false
-	}
-	select {
-	case s.pendingCh <- pendingItem{msg: msg, onSent: onSent}:
-		return true
-	default:
-		return false
-	}
+	return s.pending.push(pendingItem{msg: msg, onSent: onSent})
 }
 
-// DrainOnePending moves one pending item into the inflight tracker and sends it.
-// Called from ACK handlers to refill the pipeline after a slot opens.
-// Returns without action if there is nothing pending or the session is disconnected.
-func (s *Session) DrainOnePending(deliver func(msg *message.Envelope, onSent func()) error) {
-	if s.pendingCh == nil {
-		return
-	}
-	select {
-	case item := <-s.pendingCh:
-		if err := deliver(item.msg, item.onSent); err != nil {
-			message.Release(item.msg)
-		}
-	default:
+// DrainOnePending hands the oldest pending message to deliver, which takes
+// ownership of it on every path, its errors included: a delivery that fails
+// may still hold the message, in the inflight tracker for a retry, so
+// releasing it here as well would return it to the pool twice. Called from
+// ACK handlers to refill the pipeline after a slot opens. Returns without
+// action if there is nothing pending.
+func (s *Session) DrainOnePending(deliver func(msg *message.Envelope, onSent func())) {
+	if item, ok := s.pending.pop(); ok {
+		deliver(item.msg, item.onSent)
 	}
 }
 
 // drainPendingToOffline moves all remaining pending messages to the offline queue.
 // Called on disconnect so QoS > 0 pending messages are preserved.
 func (s *Session) drainPendingToOffline() {
-	if s.pendingCh == nil {
-		return
-	}
 	for {
-		select {
-		case item := <-s.pendingCh:
-			if item.msg.BrokerMeta.Delivery.QoS > 0 {
-				if err := s.OfflineQueue().Enqueue(item.msg); err != nil {
-					message.Release(item.msg)
-					continue
-				}
-				message.Release(item.msg)
-			} else {
-				message.Release(item.msg)
-			}
-		default:
+		item, ok := s.pending.pop()
+		if !ok {
 			return
 		}
+		if item.msg.BrokerMeta.Delivery.QoS > 0 {
+			// Enqueue keeps its own reference; ours is released either way.
+			_ = s.OfflineQueue().Enqueue(item.msg)
+		}
+		message.Release(item.msg)
 	}
 }
 
 // ClearMessages releases every envelope owned by the session. The session
 // must be disconnected before this terminal cleanup runs.
 func (s *Session) ClearMessages() {
-	if s.pendingCh != nil {
-		for {
-			select {
-			case item := <-s.pendingCh:
-				message.Release(item.msg)
-			default:
-				goto pendingDrained
-			}
+	for {
+		item, ok := s.pending.pop()
+		if !ok {
+			break
 		}
+		message.Release(item.msg)
 	}
-
-pendingDrained:
 	for _, msg := range s.OfflineQueue().Drain() {
 		message.Release(msg)
 	}
@@ -867,18 +845,44 @@ func (s *Session) NextPacketID() uint16 {
 // neither redeliver onto the replacement connection nor consume or update the
 // replacement generation's retry state.
 func (s *Session) ProcessRetriesTo(w core.PacketWriter, gen uint64) {
+	if version, ok := s.versionIfEpoch(w, gen); ok {
+		quota := sendQuota{
+			acquire: s.sendQuotaAcquirer(gen),
+			release: func(packetID uint16) { s.ReleaseSendQuota(packetID, gen) },
+		}
+		s.msgHandler.resendOlderThan(RetryTimeout, w, version, quota, s.markRetryIfEpoch(gen))
+	}
+}
+
+// ResendUnacknowledgedTo resends every unacknowledged outbound message on w
+// for generation gen. It is for a resumed session, which must not leave the
+// client waiting a retry interval for messages its previous connection lost
+// [MQTT-4.4.0-1].
+//
+// Each resend waits for send quota, so a backlog larger than the client's
+// Receive Maximum goes out as acknowledgements free it. Those arrive on the
+// same connection: the caller must run this alongside its read loop, never
+// before it. It returns early once gen is superseded or the session
+// disconnects.
+func (s *Session) ResendUnacknowledgedTo(w core.PacketWriter, gen uint64) {
+	if version, ok := s.versionIfEpoch(w, gen); ok {
+		quota := sendQuota{
+			acquire: func(packetID uint16) bool { return s.AcquireSendQuota(packetID, gen) },
+			release: func(packetID uint16) { s.ReleaseSendQuota(packetID, gen) },
+		}
+		s.msgHandler.ResendUnacknowledged(w, version, quota, s.markRetryIfEpoch(gen))
+	}
+}
+
+// versionIfEpoch returns the session's protocol version while gen is still
+// its current connection generation and w is a connection to write to.
+func (s *Session) versionIfEpoch(w core.PacketWriter, gen uint64) (byte, bool) {
 	if w == nil {
-		return
+		return 0, false
 	}
 	s.mu.RLock()
-	if s.epoch != gen {
-		s.mu.RUnlock()
-		return
-	}
-	version := s.Version
-	s.mu.RUnlock()
-
-	s.msgHandler.ProcessRetries(w, version, s.sendQuotaAcquirer(gen), s.markRetryIfEpoch(gen))
+	defer s.mu.RUnlock()
+	return s.Version, s.epoch == gen
 }
 
 // sendQuotaAcquirer returns a retry-gate bound to generation gen.

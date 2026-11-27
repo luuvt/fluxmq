@@ -19,6 +19,9 @@ var (
 	// maximum packet size the connection accepts. It is reported from the fixed
 	// header, before any memory is reserved for the body.
 	ErrPacketTooLarge = errors.New("packet exceeds maximum allowed size")
+	// ErrFailRemaining is for a body that does not match its length; this is
+	// for a length the packet type forbids.
+	ErrInvalidRemainingLength = errors.New("invalid remaining length for packet type")
 )
 
 // Protocol version constants.
@@ -143,6 +146,12 @@ func (fh FixedHeader) String() string {
 
 // Encode serializes the fixed header to bytes.
 func (fh FixedHeader) Encode() []byte {
+	return fh.AppendTo(nil)
+}
+
+// AppendTo appends the encoded fixed header to dst and returns the extended
+// buffer.
+func (fh FixedHeader) AppendTo(dst []byte) []byte {
 	var dup, retain byte
 	if fh.Dup {
 		dup = 1
@@ -150,8 +159,15 @@ func (fh FixedHeader) Encode() []byte {
 	if fh.Retain {
 		retain = 1
 	}
-	ret := []byte{fh.PacketType<<4 | dup<<3 | fh.QoS<<1 | retain}
-	return append(ret, codec.EncodeVBI(fh.RemainingLength)...)
+	dst = append(dst, fh.PacketType<<4|dup<<3|fh.QoS<<1|retain)
+	for v := uint32(fh.RemainingLength); ; {
+		b := byte(v & 0x7F)
+		v >>= 7
+		if v == 0 {
+			return append(dst, b)
+		}
+		dst = append(dst, b|0x80)
+	}
 }
 
 // Decode parses the fixed header from the type/flags byte and reader.
@@ -166,7 +182,10 @@ func (fh *FixedHeader) Decode(typeAndFlags byte, r io.Reader) error {
 
 	var err error
 	fh.RemainingLength, err = codec.DecodeVBI(r)
-	return err
+	if err != nil {
+		return err
+	}
+	return fh.validateRemainingLength()
 }
 
 // DecodeFromBytes parses the fixed header from a byte slice.
@@ -197,11 +216,24 @@ func (fh *FixedHeader) DecodeFromBytes(data []byte) (int, error) {
 		vbi |= uint32(b&0x7F) << multiplier
 		if (b & 0x80) == 0 {
 			fh.RemainingLength = int(vbi)
-			return offset, nil
+			return offset, fh.validateRemainingLength()
 		}
 		multiplier += 7
 	}
 	return 0, codec.ErrMalformedVBI
+}
+
+// validateRemainingLength rejects a body on packets that never carry one
+// [MQTT-3.12.1, MQTT-3.13.1]. Accepting it would also leave a stale length in
+// the header that re-encoding writes back out.
+func (fh FixedHeader) validateRemainingLength() error {
+	switch fh.PacketType {
+	case PingReqType, PingRespType:
+		if fh.RemainingLength != 0 {
+			return ErrInvalidRemainingLength
+		}
+	}
+	return nil
 }
 
 func (fh FixedHeader) validateFlags() error {
