@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"testing"
 
@@ -95,7 +94,7 @@ func (c *shareStubCluster) sends() []shareSend {
 func newClusteredShareBroker(t *testing.T, cl cluster.Cluster, filter string, qos byte, clientIDs ...string) (*Broker, map[string]*shareGroupMember) {
 	t.Helper()
 
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(memory.New(), cl, WithLogger(logger))
 	t.Cleanup(func() { b.Close() })
 
@@ -307,7 +306,7 @@ func TestShareGroup_DistinctGroupsEachReceiveACopy(t *testing.T) {
 				groupMember("remote-b", "node-c", tc.shareB, tc.filtB, 0),
 			}}
 
-			logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+			logger := slog.New(slog.DiscardHandler)
 			b := NewBroker(memory.New(), cl, WithLogger(logger))
 			t.Cleanup(func() { b.Close() })
 
@@ -334,7 +333,7 @@ func TestShareGroup_DistinctGroupsRotateIndependently(t *testing.T) {
 		groupMember("remote-a", "node-b", "workers", testTasksFilter, 0),
 	}}
 
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(memory.New(), cl, WithLogger(logger))
 	t.Cleanup(func() { b.Close() })
 
@@ -389,7 +388,7 @@ func TestShareGroup_MemberKeepsItsOwnQoS(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cl := &shareStubCluster{}
-			logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+			logger := slog.New(slog.DiscardHandler)
 			b := NewBroker(memory.New(), cl, WithLogger(logger))
 			t.Cleanup(func() { b.Close() })
 
@@ -416,7 +415,7 @@ func TestShareGroup_MemberKeepsItsOwnQoS(t *testing.T) {
 // than being ignored as a duplicate member.
 func TestShareGroup_ResubscribeUpdatesMemberQoS(t *testing.T) {
 	cl := &shareStubCluster{}
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(memory.New(), cl, WithLogger(logger))
 	t.Cleanup(func() { b.Close() })
 

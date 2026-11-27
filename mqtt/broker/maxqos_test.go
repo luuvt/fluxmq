@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/absmach/fluxmq/cluster"
@@ -24,7 +23,7 @@ import (
 func TestMaxQoS_DefaultValue(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	if got := b.MaxQoS(); got != 2 {
@@ -35,7 +34,7 @@ func TestMaxQoS_DefaultValue(t *testing.T) {
 func TestMaxQoS_SetValue(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	tests := []struct {
@@ -68,7 +67,7 @@ func newMaxQoSBroker(t *testing.T, maxQoS byte, clientVersion byte) (*Broker, *c
 
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 	t.Cleanup(func() { b.Close() }) //nolint:errcheck // best-effort teardown
 

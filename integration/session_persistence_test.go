@@ -40,7 +40,7 @@ func startBroker(t *testing.T, dataDir string, tcpPort int) *testBrokerInstance 
 	store, err := badger.New(badger.Config{Dir: storageDir})
 	require.NoError(t, err)
 
-	nullLogger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	nullLogger := slog.New(slog.DiscardHandler)
 	b := broker.NewBroker(store, nil, broker.WithLogger(nullLogger))
 
 	tcpAddr := fmt.Sprintf("127.0.0.1:%d", tcpPort)

@@ -249,7 +249,7 @@ func (tc *TestCluster) startNode(node *TestNode, bootstrap bool, peerTransports 
 
 	// Create cluster
 	// Create null logger to reduce test noise
-	nullLogger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	nullLogger := slog.New(slog.DiscardHandler)
 
 	clusterCfg := &cluster.EtcdConfig{
 		NodeID:         node.ID,
