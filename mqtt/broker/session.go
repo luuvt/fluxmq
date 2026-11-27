@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/absmach/fluxmq/broker/events"
@@ -387,6 +388,10 @@ func (b *Broker) createSession(clientID string, version byte, opts session.Optio
 		opts.ExpiryInterval = sessionCfg.DefaultExpiryInterval
 	}
 
+	if version != 5 && !opts.CleanStart && opts.ExpiryInterval == 0 {
+		opts.ExpiryInterval = persistentV3Expiry(sessionCfg)
+	}
+
 	// Override receive maximum with normalized value
 	opts.ReceiveMaximum = receiveMax
 
@@ -494,6 +499,14 @@ func (b *Broker) attachSession(ctx context.Context, s *session.Session, claim se
 	if expiryInterval != nil && claim.continuesSession {
 		s.SetExpiryInterval(*expiryInterval)
 		s.SetConnectExpiryInterval(*expiryInterval)
+	}
+	// A 3.x CONNECT carries no interval, so a session it continues keeps the
+	// one it already had. When that is zero - an MQTT 5 connection on the same
+	// client ID asked for it - CleanSession=0 would still end the session at
+	// the next disconnect. 3.x has no way to ask for that, so apply the
+	// persistent 3.x interval instead.
+	if expiryInterval == nil && opts.Version != 5 && claim.continuesSession && s.Info().ExpiryInterval == 0 {
+		s.SetExpiryInterval(persistentV3Expiry(b.cfg.sessionCfg.Load()))
 	}
 	b.BindExternalID(s.ID, s.ExternalIdentity())
 	b.persistSessionInfo(s)
@@ -1095,6 +1108,14 @@ func (b *Broker) restoreSessionFromStorage(s *session.Session, clientID string, 
 		// session written before identities were resolved. Re-binding puts the
 		// identity this CONNECT authenticated as back on the session.
 		s.RestoreFrom(stored)
+		// A 3.x CONNECT sends no interval, so attachSession keeps whatever the
+		// record holds. A record with zero, written before persistent 3.x
+		// sessions were mapped to "never expires" or by an MQTT 5 connection
+		// that asked for zero, would end this CleanSession=0 session on its
+		// next disconnect. Keep the interval createSession settled on instead.
+		if s.Version != 5 && stored.ExpiryInterval == 0 {
+			s.SetExpiryInterval(opts.ExpiryInterval)
+		}
 		if identity != nil && !s.BindExternalIdentity(identity.ExternalID, identity.RequireBound) {
 			b.logIdentityRejected("mqtt_persistent_session_identity_mismatch", clientID, stored.ExternalID, identity.ExternalID)
 			return cluster.ErrSessionIdentityMismatch
@@ -1379,4 +1400,17 @@ func (b *Broker) persistOfflineQueue(s *session.Session) {
 		b.stores.messages.Store(key, msg) //nolint:errcheck // best-effort offline message persistence during close
 		message.Release(msg)
 	}
+}
+
+// persistentV3Expiry is the Session Expiry Interval a CleanSession=0 session
+// from an MQTT 3.x client runs with. 3.x has no expiry of its own: such a
+// session lasts until the client ends it, which MQTT 5 spells as 0xFFFFFFFF.
+// A configured default still caps it, so abandoned sessions do not pile up.
+// Zero is never returned: it would end the session at disconnect, taking its
+// subscriptions and queued messages with it.
+func persistentV3Expiry(cfg *config.SessionConfig) uint32 {
+	if cfg != nil && cfg.DefaultExpiryInterval > 0 {
+		return cfg.DefaultExpiryInterval
+	}
+	return math.MaxUint32
 }

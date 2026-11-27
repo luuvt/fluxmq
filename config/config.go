@@ -877,7 +877,11 @@ type SessionConfig struct {
 	// Maximum sessions allowed
 	MaxSessions int `yaml:"max_sessions"`
 
-	// Default expiry interval (seconds) if client doesn't specify
+	// Default expiry interval (seconds) for a persistent session whose client
+	// sets none: MQTT 5 without Session Expiry, or MQTT 3.x with
+	// CleanSession=0. Zero means no default: an MQTT 5 session then ends at
+	// disconnect, while an MQTT 3.x persistent session never expires, since
+	// 3.x has no way to ask for an expiry.
 	DefaultExpiryInterval uint32 `yaml:"default_expiry_interval"`
 
 	// Maximum queued messages per offline client

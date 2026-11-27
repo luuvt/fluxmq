@@ -6,6 +6,7 @@ package broker
 import (
 	"context"
 	"io"
+	"math"
 	"slices"
 	"sync"
 	"testing"
@@ -1325,4 +1326,111 @@ func (*cleanupSpyCluster) ShareGroupMembers(_ context.Context, _ string, dst []c
 
 func (*cleanupSpyCluster) RoutePublishToClient(context.Context, string, string, *message.Envelope) error {
 	return cluster.ErrClusterNotEnabled
+}
+
+// A 3.1.1 client with CleanSession=0 has no Session Expiry to send. Without a
+// configured default, the session must still outlive its connection: ending it
+// on disconnect would drop the subscriptions and hand the client ID's cluster
+// ownership away, so a reconnect would start from nothing.
+func TestHandleDisconnect_PersistentV3SessionSurvivesWithoutDefaultExpiry(t *testing.T) {
+	cl := &cleanupSpyCluster{}
+	b := NewBroker(nil, cl)
+	defer b.Close()
+
+	const clientID = "persistent-v3-no-default"
+	s, _, err := b.CreateSession(clientID, 4, session.Options{CleanStart: false})
+	require.NoError(t, err)
+	require.Equal(t, uint32(math.MaxUint32), s.ExpiryInterval)
+	_, _, releasesBefore, removalsBefore := cl.snapshot()
+
+	b.handleDisconnect(s, session.DisconnectAbnormal, s.Epoch())
+
+	require.Same(t, s, b.sessionsMap.Get(clientID))
+	owner, _, releases, removals := cl.snapshot()
+	require.True(t, owner)
+	require.Equal(t, releasesBefore, releases)
+	require.Equal(t, removalsBefore, removals)
+}
+
+// MQTT 5 states the interval outright, and zero means the session ends with
+// the connection. Only the 3.x mapping may substitute "never expires".
+func TestCreateSession_V5ZeroExpiryIsNotExtended(t *testing.T) {
+	b := NewBroker(nil, nil)
+	defer b.Close()
+
+	s, _, err := b.CreateSession("v5-zero-expiry", 5, session.Options{CleanStart: false})
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), s.ExpiryInterval)
+}
+
+// A record persisted with a zero interval - by a broker from before 3.x
+// sessions were mapped to "never expires" - must not override that mapping
+// when a 3.1.1 client resumes it. 3.x has no expiry to send, so nothing on
+// the reconnect would correct it, and the next disconnect would end the
+// session and drop its subscriptions.
+func TestCreateSession_RestoredV3SessionWithZeroStoredExpiry(t *testing.T) {
+	store := memory.New()
+	const clientID = "restored-v3-zero-expiry"
+	require.NoError(t, store.Sessions().Save(&storage.Session{
+		ClientID:       clientID,
+		Version:        4,
+		ExpiryInterval: 0,
+	}))
+	require.NoError(t, store.Subscriptions().Add(&storage.Subscription{
+		ClientID: clientID,
+		Filter:   "restored/topic",
+		QoS:      1,
+	}))
+
+	b := NewBroker(store, nil)
+	defer b.Close()
+
+	s, _, err := b.CreateSession(clientID, 4, session.Options{CleanStart: false})
+	require.NoError(t, err)
+	require.Equal(t, uint32(math.MaxUint32), s.Info().ExpiryInterval)
+	require.Len(t, s.GetSubscriptions(), 1)
+}
+
+// An MQTT 5 connection may leave a live session with a zero interval. A 3.1.1
+// client resuming it with CleanSession=0 sends no interval to replace that, so
+// the broker has to: otherwise the session would end at the next disconnect,
+// which 3.x has no way to ask for.
+func TestHandleConnect_V3ResumingV5ZeroExpirySessionKeepsIt(t *testing.T) {
+	b := NewBroker(nil, nil)
+	defer b.Close()
+
+	const clientID = "v5-then-v3"
+	v5Conn := newSyncConn()
+	var v5WG sync.WaitGroup
+	v5WG.Add(1)
+	go func() {
+		defer v5WG.Done()
+		newV5Handler(b).HandleConnect(context.Background(), v5Conn, v5Connect(clientID, "", nil)) //nolint:errcheck
+	}()
+	<-v5Conn.reading
+	waitFor(t, func() bool {
+		s := b.sessionsMap.Get(clientID)
+		return s != nil && s.IsConnected()
+	}, "v5 session connected")
+	require.Equal(t, uint32(0), b.sessionsMap.Get(clientID).Info().ExpiryInterval)
+
+	v3Conn := newBlockingConn()
+	var v3WG sync.WaitGroup
+	v3WG.Add(1)
+	go func() {
+		defer v3WG.Done()
+		_ = newV3Handler(b).HandleConnect(context.Background(), v3Conn, v3Connect(clientID))
+	}()
+	<-v3Conn.reading
+	waitFor(t, func() bool {
+		s := b.sessionsMap.Get(clientID)
+		return s != nil && s.IsConnected() && s.Conn() == v3Conn
+	}, "v3 client resumed the session")
+
+	require.Equal(t, uint32(math.MaxUint32), b.sessionsMap.Get(clientID).Info().ExpiryInterval)
+
+	v3Conn.Close()
+	v3WG.Wait()
+	v5Conn.Close()
+	v5WG.Wait()
 }
