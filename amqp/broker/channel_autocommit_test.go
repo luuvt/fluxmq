@@ -1,3 +1,6 @@
+// Copyright (c) Abstract Machines
+// SPDX-License-Identifier: Apache-2.0
+
 package broker
 
 import (
@@ -19,7 +22,7 @@ func autoCommitOn() *atomic.Bool {
 
 func streamProps(offset int) map[string]string {
 	return map[string]string{
-		message.PropertyQueueName:    "events",
+		message.PropertyQueueName:    testEvents,
 		message.PropertyGroupID:      "g@client/update",
 		message.PropertyOffset:       strconv.Itoa(offset),
 		message.PropertyStreamOffset: strconv.Itoa(offset),
@@ -29,7 +32,7 @@ func streamProps(offset int) map[string]string {
 // Client không ack trên group auto-commit không prefetch: unacked phải bị chặn trần.
 func TestAutoCommitStreamUnackedBounded(t *testing.T) {
 	ch, _ := newTestChannel(t)
-	cons := &consumer{tag: "c1", queueName: "events"}
+	cons := &consumer{tag: "c1", queueName: testEvents}
 	cons.autoCommitStream = autoCommitOn()
 
 	n := maxAutoCommitUnacked + 500
@@ -51,7 +54,7 @@ func TestUnackedNotTrimmedWithPrefetchOrManual(t *testing.T) {
 
 	ch, _ := newTestChannel(t)
 	ch.prefetchCount = 50000
-	ac := &consumer{tag: "c1", queueName: "events"}
+	ac := &consumer{tag: "c1", queueName: testEvents}
 	ac.autoCommitStream = autoCommitOn()
 	for i := 0; i < n; i++ {
 		require.NoError(t, ch.sendDelivery(ac, "client/update", []byte("x"), streamProps(i)))
@@ -59,7 +62,7 @@ func TestUnackedNotTrimmedWithPrefetchOrManual(t *testing.T) {
 	assert.Len(t, ch.unacked, n)
 
 	ch2, _ := newTestChannel(t)
-	manual := &consumer{tag: "c2", queueName: "events"}
+	manual := &consumer{tag: "c2", queueName: testEvents}
 	for i := 0; i < n; i++ {
 		require.NoError(t, ch2.sendDelivery(manual, "client/update", []byte("x"), streamProps(i)))
 	}
@@ -69,7 +72,7 @@ func TestUnackedNotTrimmedWithPrefetchOrManual(t *testing.T) {
 // Ack tag đã bị cắt thì bỏ qua êm, ack tag còn giữ thì xoá khỏi map.
 func TestAutoCommitAckAfterTrim(t *testing.T) {
 	ch, _ := newTestChannel(t)
-	cons := &consumer{tag: "c1", queueName: "events"}
+	cons := &consumer{tag: "c1", queueName: testEvents}
 	cons.autoCommitStream = autoCommitOn()
 	for i := 0; i < maxAutoCommitUnacked+1; i++ {
 		require.NoError(t, ch.sendDelivery(cons, "client/update", []byte("x"), streamProps(i)))
