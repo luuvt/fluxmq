@@ -23,4 +23,9 @@ const (
 	testGroupConsumerA   = "c-1"
 	testGroupConsumerB   = "c-2"
 	testClientTwoID      = "client-2"
+	testQueueReplication = "replication"
+	testNodeLeader       = "node-leader"
+	testMethodAck        = "Ack"
+	testMethodNack       = "Nack"
+	testMethodReject     = "Reject"
 )

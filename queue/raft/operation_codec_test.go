@@ -34,22 +34,22 @@ func TestOperationCodecRoundTripsEveryCommand(t *testing.T) {
 	queueConfig := conformanceQueueConfig()
 
 	operations := map[string]*Operation{
-		"append":              {Type: OpAppend, Timestamp: now, QueueName: testOperationQueue, Message: []byte{0, 1, 2, 255}, DedupeKey: "transfer-1"},
-		"truncate":            {Type: OpTruncate, Timestamp: now, QueueName: testOperationQueue, MinOffset: 10},
-		"create group":        {Type: OpCreateGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, GroupState: group},
-		"update group":        {Type: OpUpdateGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, GroupState: group},
-		"delete group":        {Type: OpDeleteGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup},
-		"update cursor":       {Type: OpUpdateCursor, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Cursor: 20},
-		"update committed":    {Type: OpUpdateCommitted, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Committed: 19},
-		"add pending":         {Type: OpAddPending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, PendingEntry: &types.PendingEntry{Offset: 20, ConsumerID: testOperationConsumerA, ClaimedAt: now, DeliveryCount: 3}},
-		"remove pending":      {Type: OpRemovePending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: testOperationConsumerA, Offset: 20},
-		"transfer pending":    {Type: OpTransferPending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Offset: 20, FromConsumer: testOperationConsumerA, ToConsumer: testOperationConsumerB},
-		"register consumer":   {Type: OpRegisterConsumer, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerInfo: &types.ConsumerInfo{ID: "consumer-c", ClientID: "client-c", ProxyNodeID: "node-c", RegisteredAt: now, LastHeartbeat: now}},
-		"unregister consumer": {Type: OpUnregisterConsumer, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: "consumer-c"},
-		"requeue pending":     {Type: OpRequeuePending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: testOperationConsumerA, Offset: 20},
-		"create queue":        {Type: OpCreateQueue, Timestamp: now, QueueName: testOperationQueue, QueueConfig: &queueConfig},
-		"update queue":        {Type: OpUpdateQueue, Timestamp: now, QueueName: testOperationQueue, QueueConfig: &queueConfig},
-		"delete queue":        {Type: OpDeleteQueue, Timestamp: now, QueueName: testOperationQueue},
+		"append":                 {Type: OpAppend, Timestamp: now, QueueName: testOperationQueue, Message: []byte{0, 1, 2, 255}, DedupeKey: "transfer-1"},
+		"truncate":               {Type: OpTruncate, Timestamp: now, QueueName: testOperationQueue, MinOffset: 10},
+		"create group":           {Type: OpCreateGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, GroupState: group},
+		"update group":           {Type: OpUpdateGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, GroupState: group},
+		"delete group":           {Type: OpDeleteGroup, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup},
+		"update cursor":          {Type: OpUpdateCursor, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Cursor: 20},
+		"update committed":       {Type: OpUpdateCommitted, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Committed: 19},
+		testCaseAddPending:       {Type: OpAddPending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, PendingEntry: &types.PendingEntry{Offset: 20, ConsumerID: testOperationConsumerA, ClaimedAt: now, DeliveryCount: 3}},
+		"remove pending":         {Type: OpRemovePending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: testOperationConsumerA, Offset: 20},
+		"transfer pending":       {Type: OpTransferPending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, Offset: 20, FromConsumer: testOperationConsumerA, ToConsumer: testOperationConsumerB},
+		testCaseRegisterConsumer: {Type: OpRegisterConsumer, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerInfo: &types.ConsumerInfo{ID: "consumer-c", ClientID: "client-c", ProxyNodeID: "node-c", RegisteredAt: now, LastHeartbeat: now}},
+		"unregister consumer":    {Type: OpUnregisterConsumer, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: "consumer-c"},
+		"requeue pending":        {Type: OpRequeuePending, Timestamp: now, QueueName: testOperationQueue, GroupID: testOperationGroup, ConsumerID: testOperationConsumerA, Offset: 20},
+		"create queue":           {Type: OpCreateQueue, Timestamp: now, QueueName: testOperationQueue, QueueConfig: &queueConfig},
+		"update queue":           {Type: OpUpdateQueue, Timestamp: now, QueueName: testOperationQueue, QueueConfig: &queueConfig},
+		"delete queue":           {Type: OpDeleteQueue, Timestamp: now, QueueName: testOperationQueue},
 	}
 
 	for name, operation := range operations {
@@ -171,14 +171,14 @@ func TestOperationCodecRejectsUnknownFields(t *testing.T) {
 
 func TestOperationCodecRejectsIncompleteDomainOperations(t *testing.T) {
 	tests := map[string]*Operation{
-		"nil":               nil,
-		"unknown type":      {Type: OpType(255)},
-		"create group":      {Type: OpCreateGroup},
-		"update group":      {Type: OpUpdateGroup},
-		"add pending":       {Type: OpAddPending},
-		"register consumer": {Type: OpRegisterConsumer},
-		"create queue":      {Type: OpCreateQueue},
-		"update queue":      {Type: OpUpdateQueue},
+		"nil":                    nil,
+		"unknown type":           {Type: OpType(255)},
+		"create group":           {Type: OpCreateGroup},
+		"update group":           {Type: OpUpdateGroup},
+		testCaseAddPending:       {Type: OpAddPending},
+		testCaseRegisterConsumer: {Type: OpRegisterConsumer},
+		"create queue":           {Type: OpCreateQueue},
+		"update queue":           {Type: OpUpdateQueue},
 	}
 	for name, operation := range tests {
 		t.Run(name, func(t *testing.T) {

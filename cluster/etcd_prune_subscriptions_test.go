@@ -14,8 +14,8 @@ import (
 )
 
 // TestPruneOrphanedSubscriptions_RemovesEntryWithNoLiveOwner is the
-// regression test for the production incident tracked in aiot_cloud's
-// TODO-fluxmq-upgrade.md (2026-09-08): RoutePublish's cross-node routing
+// regression test for the production incident logged on 2026-09-08 in
+// aiot_cloud's fluxmq upgrade notes: RoutePublish's cross-node routing
 // permanently drops messages for a topic once a subscription entry
 // outlives its session. AddSubscription's entries carry no lease (unlike
 // AcquireSession's owner key), and the only existing cleanup --

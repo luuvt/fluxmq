@@ -9,4 +9,7 @@ const (
 	testGroupHot     = "hot"
 	testRaftNode1    = "node1"
 	testRaftDataDir  = "/tmp/fluxmq/raft"
+
+	testCaseAddPending       = "add pending"
+	testCaseRegisterConsumer = "register consumer"
 )

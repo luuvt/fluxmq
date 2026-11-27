@@ -703,7 +703,7 @@ func TestProtectedQueueRejectsContractMutationsAndDelete(t *testing.T) {
 		{name: "type", mutate: func(config *types.QueueConfig) { config.Type = types.QueueTypeClassic }},
 		{name: "durable", mutate: func(config *types.QueueConfig) { config.Durable = false }},
 		{name: "reserved", mutate: func(config *types.QueueConfig) { config.Reserved = false }},
-		{name: "replication", mutate: func(config *types.QueueConfig) { config.Replication.Enabled = true }},
+		{name: testQueueReplication, mutate: func(config *types.QueueConfig) { config.Replication.Enabled = true }},
 		{name: "retention age", mutate: func(config *types.QueueConfig) { config.Retention.RetentionTime-- }},
 		{name: "retention bytes", mutate: func(config *types.QueueConfig) { config.Retention.RetentionBytes-- }},
 		{name: "retention messages", mutate: func(config *types.QueueConfig) { config.Retention.RetentionMessages++ }},

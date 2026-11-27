@@ -55,9 +55,9 @@ func (f *allOpsForwarder) recorded() []string {
 // leader has delivered offsets 0 and 1 and the consumer has acked both.
 func newReplicatedManualStreamNode(t *testing.T, isLeader bool, consumerNode string) (*Manager, *allOpsForwarder, func() []uint64) {
 	t.Helper()
-	const queueName = "replication"
+	const queueName = testQueueReplication
 	const groupID = "channels@aiot_cloud/group/+"
-	const consumerID = "consumer-1"
+	const consumerID = testConsumerOne
 
 	logStore := memlog.New()
 	groupStore := newMockGroupStore()
@@ -81,7 +81,7 @@ func newReplicatedManualStreamNode(t *testing.T, isLeader bool, consumerNode str
 		enabled:           true,
 		replicatedByQueue: map[string]bool{queueName: true},
 		leaderByQueue:     map[string]bool{queueName: isLeader},
-		leaderIDByQueue:   map[string]string{queueName: "node-leader"},
+		leaderIDByQueue:   map[string]string{queueName: testNodeLeader},
 	}
 	forwarder := new(allOpsForwarder)
 	manager.SetRaftCoordinator(coordinator)
@@ -119,7 +119,7 @@ func newReplicatedManualStreamNode(t *testing.T, isLeader bool, consumerNode str
 // correct.
 func TestReplicatedManualStream_LeaderDeliversFromItsView(t *testing.T) {
 	manager, _, delivered := newReplicatedManualStreamNode(t, true, "")
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	got := delivered()
 	if len(got) != 1 || got[0] != 0 {
@@ -134,7 +134,7 @@ func TestReplicatedManualStream_LeaderDeliversFromItsView(t *testing.T) {
 // arrives AFTER newer records (offset 1 here), i.e. out of order.
 func TestReplicatedManualStream_FollowerMustNotDeliverFromLaggingView(t *testing.T) {
 	manager, forwarder, delivered := newReplicatedManualStreamNode(t, false, "")
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if got := delivered(); len(got) > 0 {
 		t.Errorf("BUG: follower delivered offsets %v from its lagging local view of a replicated queue "+
@@ -151,9 +151,9 @@ func TestReplicatedManualStream_LeaderRoutesToConsumerOnFollower(t *testing.T) {
 	manager, _, delivered := newReplicatedManualStreamNode(t, true, "node-follower")
 	remote := &mockRemoteRouter{}
 	manager.delivery.remote = remote
-	manager.delivery.localNodeID = "node-leader"
+	manager.delivery.localNodeID = testNodeLeader
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if got := delivered(); len(got) != 0 {
 		t.Fatalf("leader delivered locally %v to a consumer that lives on node-follower", got)
@@ -187,15 +187,15 @@ func TestForwardedSettlementSchedulesLeaderDelivery(t *testing.T) {
 
 	wire, err := encodeGroupOperation(&raft.Operation{
 		Type:       raft.OpRemovePending,
-		QueueName:  "replicated",
+		QueueName:  testReplicatedQueue,
 		GroupID:    "workers",
-		ConsumerID: "consumer-1",
+		ConsumerID: testConsumerOne,
 		Offset:     7,
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if err := mgr.HandleForwardedGroupOp(context.Background(), "replicated", wire); err != nil {
+	if err := mgr.HandleForwardedGroupOp(context.Background(), testReplicatedQueue, wire); err != nil {
 		t.Fatalf("HandleForwardedGroupOp: %v", err)
 	}
 	if replicator.removed != 1 {
@@ -204,7 +204,7 @@ func TestForwardedSettlementSchedulesLeaderDelivery(t *testing.T) {
 
 	select {
 	case queueName := <-mgr.delivery.schedule.pending():
-		if queueName != "replicated" {
+		if queueName != testReplicatedQueue {
 			t.Fatalf("scheduled %q, want replicated", queueName)
 		}
 	default:
@@ -222,11 +222,11 @@ func TestReplicatedPullClaimRequiresLeader(t *testing.T) {
 		ctx := context.Background()
 
 		consumeOutcome, consumeErr := manager.StateMachine().Consume(ctx, ConsumeCommand{
-			QueueName: "replication", GroupID: "channels@aiot_cloud/group/+", ConsumerID: "consumer-1", Limit: 10,
+			QueueName: testQueueReplication, GroupID: "channels@aiot_cloud/group/+", ConsumerID: testConsumerOne, Limit: 10,
 		})
 		releaseEnvelopes(consumeOutcome.Messages)
 		_, claimErr := manager.StateMachine().Claim(ctx, ClaimCommand{
-			QueueName: "replication", GroupID: "channels@aiot_cloud/group/+", ConsumerID: "consumer-1", Limit: 10,
+			QueueName: testQueueReplication, GroupID: "channels@aiot_cloud/group/+", ConsumerID: testConsumerOne, Limit: 10,
 		})
 
 		if isLeader {
@@ -260,9 +260,9 @@ func TestReplicatedPullClaimRequiresLeader(t *testing.T) {
 // adapters' settlements, which name no consumer, still work from a follower.
 func TestReplicatedOwnedSettlementRequiresLeader(t *testing.T) {
 	const (
-		queueName = "replication"
+		queueName = testQueueReplication
 		groupID   = "channels@aiot_cloud/group/+"
-		owner     = "consumer-1"
+		owner     = testConsumerOne
 	)
 	ctx := context.Background()
 	manager, forwarder, _ := newReplicatedManualStreamNode(t, false, "")
@@ -275,7 +275,7 @@ func TestReplicatedOwnedSettlementRequiresLeader(t *testing.T) {
 	_, ackErr := manager.StateMachine().Ack(ctx, AckCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
 	_, nackErr := manager.StateMachine().Nack(ctx, NackCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
 	_, rejectErr := manager.StateMachine().Reject(ctx, RejectCommand{QueueName: queueName, GroupID: groupID, ConsumerID: owner, Offsets: []uint64{0}})
-	for name, err := range map[string]error{"Ack": ackErr, "Nack": nackErr, "Reject": rejectErr} {
+	for name, err := range map[string]error{testMethodAck: ackErr, testMethodNack: nackErr, testMethodReject: rejectErr} {
 		failure := ClassifyError(err)
 		if err == nil || failure.Leader != LeaderNotLocal || !failure.Retryable {
 			t.Fatalf("follower: %s naming its consumer must refuse with a retryable not-local failure, got %v", name, err)

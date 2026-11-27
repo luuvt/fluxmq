@@ -487,8 +487,11 @@ func TestPrefetchBuffering(t *testing.T) {
 	}
 
 	props := map[string]string{message.PropertyMessageID: "m1"}
-	ch.deliverMessage("q", []byte("one"), props)
-	ch.deliverMessage("q", []byte("two"), props)
+	for _, payload := range []string{"one", "two"} {
+		if _, err := ch.deliverMessage("q", []byte(payload), props); err != nil {
+			t.Fatalf("deliverMessage %s: %v", payload, err)
+		}
+	}
 
 	frames := readFramesFrom(t, buf, 0)
 	if len(frames) != 3 {
@@ -518,7 +521,9 @@ func TestChannelFlowQueueing(t *testing.T) {
 		noAck:      true,
 	}
 
-	ch.deliverMessage("q", []byte("one"), map[string]string{})
+	if _, err := ch.deliverMessage("q", []byte("one"), map[string]string{}); err != nil {
+		t.Fatalf("deliverMessage: %v", err)
+	}
 	if buf.Len() != 0 {
 		t.Fatalf("expected no frames while flow is disabled")
 	}
