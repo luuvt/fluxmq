@@ -6,7 +6,6 @@ package broker
 import (
 	"context"
 	"log/slog"
-	"os"
 	"testing"
 	"time"
 
@@ -22,7 +21,7 @@ import (
 func TestMessageExpiry_ImmediateDelivery(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s, _, _ := b.CreateSession("client1", 5, session.Options{CleanStart: true})
@@ -42,7 +41,7 @@ func TestMessageExpiry_ImmediateDelivery(t *testing.T) {
 func TestMessageExpiry_ExpiredMessage(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s, _, _ := b.CreateSession("client1", 5, session.Options{CleanStart: true})
@@ -62,7 +61,7 @@ func TestMessageExpiry_ExpiredMessage(t *testing.T) {
 func TestMessageExpiry_V5Handler(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s, _, _ := b.CreateSession("client1", 5, session.Options{CleanStart: true})
@@ -92,7 +91,7 @@ func TestMessageExpiry_V5Handler(t *testing.T) {
 func TestMessageExpiry_NoExpiry(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s, _, _ := b.CreateSession("client1", 5, session.Options{CleanStart: true})
@@ -110,7 +109,7 @@ func TestMessageExpiry_NoExpiry(t *testing.T) {
 func TestMessageExpiry_RemainingTime(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s, _, _ := b.CreateSession("client1", 5, session.Options{CleanStart: true})
@@ -155,7 +154,7 @@ func TestMessageExpiry_QoS1WithExpiry(t *testing.T) {
 
 func TestMessageExpiry_RetainedMessage(t *testing.T) {
 	store := memory.New()
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	// Create broker without cluster (nil cluster) to use local storage
 	b := NewBroker(store, nil, WithLogger(logger))
 

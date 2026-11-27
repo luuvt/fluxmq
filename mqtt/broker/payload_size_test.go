@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
-	"os"
 	"testing"
 
 	corebroker "github.com/absmach/fluxmq/broker"
@@ -28,7 +27,7 @@ import (
 func newPayloadLimitBroker(t *testing.T, maxSize int, clientVersion byte) (*Broker, *connCtx) {
 	t.Helper()
 
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(memory.New(), cluster.NewNoopCluster("test"), WithLogger(logger),
 		WithBrokerConfig(config.BrokerConfig{MaxMessageSize: maxSize}))
 	t.Cleanup(func() { b.Close() }) //nolint:errcheck // best-effort teardown

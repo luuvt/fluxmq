@@ -5,7 +5,6 @@ package broker
 
 import (
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/absmach/fluxmq/cluster"
@@ -16,7 +15,7 @@ import (
 )
 
 func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 func TestTopicAlias_RegisterAndResolve(t *testing.T) {

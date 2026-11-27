@@ -234,7 +234,7 @@ session:
 | Field                     | Default | Description                                                                               |
 | ------------------------- | ------- | ----------------------------------------------------------------------------------------- |
 | `max_sessions`            | `10000` | Maximum concurrent sessions (`>= 1`).                                                     |
-| `default_expiry_interval` | `300`   | Session expiry interval in seconds when client does not set one.                          |
+| `default_expiry_interval` | `300`   | Session expiry interval in seconds for a persistent session whose client sets none (MQTT 5 without Session Expiry, MQTT 3.x with `CleanSession=0`). `0` = no default: MQTT 5 sessions end at disconnect; MQTT 3.x persistent sessions never expire. |
 | `max_offline_queue_size`  | `1000`  | Maximum QoS 1/2 messages buffered for a disconnected client (`>= 10`).                    |
 | `max_inflight_messages`   | `256`   | Per-session inflight window size (unacknowledged outbound messages).                      |
 | `max_send_queue_size`     | `0`     | Per-connection async send queue depth. `0` = synchronous writes.                          |

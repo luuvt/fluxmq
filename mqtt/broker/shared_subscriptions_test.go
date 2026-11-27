@@ -6,7 +6,6 @@ package broker
 import (
 	"context"
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/absmach/fluxmq/cluster"
@@ -21,7 +20,7 @@ import (
 func TestSharedSubscription_GroupCreation(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	// Create 3 clients
@@ -57,7 +56,7 @@ func TestSharedSubscription_GroupCreation(t *testing.T) {
 func TestSharedSubscription_RoundRobinSelection(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -86,7 +85,7 @@ func TestSharedSubscription_RoundRobinSelection(t *testing.T) {
 func TestSharedSubscription_Unsubscribe(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -132,7 +131,7 @@ func TestSharedSubscription_Unsubscribe(t *testing.T) {
 func TestSharedSubscription_SessionDestroy(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -172,7 +171,7 @@ func TestSharedSubscription_SessionDestroy(t *testing.T) {
 func TestSharedSubscription_MultipleGroups(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -206,7 +205,7 @@ func TestSharedSubscription_MultipleGroups(t *testing.T) {
 func TestSharedSubscription_SameGroupDifferentTopics(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -239,7 +238,7 @@ func TestSharedSubscription_SameGroupDifferentTopics(t *testing.T) {
 func TestSharedSubscription_DuplicateSubscribe(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -265,7 +264,7 @@ func TestSharedSubscription_DuplicateSubscribe(t *testing.T) {
 func TestSharedSubscription_RouterIntegration(t *testing.T) {
 	store := memory.New()
 	cl := cluster.NewNoopCluster("test")
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(store, cl, WithLogger(logger))
 
 	s1, _, _ := b.CreateSession(testClient1, 5, session.Options{CleanStart: true})
@@ -305,7 +304,7 @@ type shareGroupMember struct {
 func newShareGroupBroker(t *testing.T, filter string, qos byte, clientIDs ...string) (*Broker, map[string]*shareGroupMember) {
 	t.Helper()
 
-	logger := slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil))
+	logger := slog.New(slog.DiscardHandler)
 	b := NewBroker(memory.New(), cluster.NewNoopCluster("test"), WithLogger(logger))
 	t.Cleanup(func() { b.Close() })
 
