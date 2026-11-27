@@ -173,7 +173,7 @@ func TestLogFSMGroupOpsAfterGroupDeletedAreRefusedNotFatal(t *testing.T) {
 				op.Type, op.FromConsumer, op.ToConsumer = OpTransferPending, raceNewOwner, testOperationConsumerB
 			}))
 		},
-		"add pending": func() *ApplyResult {
+		testCaseAddPending: func() *ApplyResult {
 			return fsm.applyAddPending(ctx, with(func(op *Operation) {
 				op.Type = OpAddPending
 				op.PendingEntry = &types.PendingEntry{Offset: raceOffset + 1, ConsumerID: raceNewOwner, ClaimedAt: conformanceTime, DeliveryCount: 1}
@@ -182,7 +182,7 @@ func TestLogFSMGroupOpsAfterGroupDeletedAreRefusedNotFatal(t *testing.T) {
 		"update cursor": func() *ApplyResult {
 			return fsm.applyUpdateCursor(ctx, with(func(op *Operation) { op.Type, op.Cursor = OpUpdateCursor, raceOffset+1 }))
 		},
-		"register consumer": func() *ApplyResult {
+		testCaseRegisterConsumer: func() *ApplyResult {
 			return fsm.applyRegisterConsumer(ctx, with(func(op *Operation) {
 				op.Type = OpRegisterConsumer
 				op.ConsumerInfo = &types.ConsumerInfo{ID: raceNewOwner, ClientID: raceNewOwner, RegisteredAt: conformanceTime, LastHeartbeat: conformanceTime}

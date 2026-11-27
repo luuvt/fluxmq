@@ -64,14 +64,14 @@ func newFencedLeader(t *testing.T, consumerNode string, term uint64) (*Manager, 
 	coordinator := &fencingCoordinator{
 		mockQueueCoordinator: &mockQueueCoordinator{
 			enabled:           true,
-			replicatedByQueue: map[string]bool{"replication": true},
-			leaderByQueue:     map[string]bool{"replication": true},
-			leaderIDByQueue:   map[string]string{"replication": "node-leader"},
+			replicatedByQueue: map[string]bool{testQueueReplication: true},
+			leaderByQueue:     map[string]bool{testQueueReplication: true},
+			leaderIDByQueue:   map[string]string{testQueueReplication: testNodeLeader},
 		},
 		term: term,
 	}
 	manager.SetRaftCoordinator(coordinator)
-	manager.delivery.localNodeID = "node-leader"
+	manager.delivery.localNodeID = testNodeLeader
 	return manager, coordinator, delivered
 }
 
@@ -83,7 +83,7 @@ func TestReplicatedDeliveryCarriesLeaderTerm(t *testing.T) {
 	router := &termRecordingRouter{}
 	manager.delivery.remote = router
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if len(router.terms) != 1 || router.terms[0] != 7 {
 		t.Fatalf("expected one delivery stamped with term 7, got %v", router.terms)
@@ -97,7 +97,7 @@ func TestReplicatedDeliveryReadsTermBeforeLeadership(t *testing.T) {
 	manager, coordinator, _ := newFencedLeader(t, "node-follower", 7)
 	manager.delivery.remote = &termRecordingRouter{}
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if len(coordinator.calls) < 2 || coordinator.calls[0] != "term" || coordinator.calls[1] != "leader" {
 		t.Fatalf("the term must be read before the leadership check, got %v", coordinator.calls)
@@ -110,14 +110,14 @@ func TestReplicatedDeliveryWaitsForConfirmedLeadership(t *testing.T) {
 	manager, coordinator, delivered := newFencedLeader(t, "", 7)
 	coordinator.verifyErr = errors.New("leadership lost")
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if got := delivered(); len(got) != 0 {
 		t.Fatalf("an unconfirmed leader delivered %v", got)
 	}
 
 	coordinator.verifyErr = nil
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 	if got := delivered(); len(got) != 1 {
 		t.Fatalf("a confirmed leader must deliver, got %v", got)
 	}
@@ -131,7 +131,7 @@ func TestStaleLeaderRefusalIsNotRetriedUnfenced(t *testing.T) {
 	router := &termRecordingRouter{batchErrs: []error{fmt.Errorf("%w: refused", cluster.ErrStaleLeaderDelivery)}}
 	manager.delivery.remote = router
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if router.batches != 1 {
 		t.Fatalf("expected a single batch attempt, got %d", router.batches)
@@ -148,7 +148,7 @@ func TestStampedDeliveryFallbackKeepsItsTerm(t *testing.T) {
 	router := &termRecordingRouter{batchErrs: []error{errors.New("coalesced batch failed")}}
 	manager.delivery.remote = router
 
-	manager.delivery.DeliverQueue(context.Background(), "replication")
+	manager.delivery.DeliverQueue(context.Background(), testQueueReplication)
 
 	if len(router.routed) != 0 {
 		t.Fatalf("a stamped delivery fell back to the unfenced single-message path: %+v", router.routed)
@@ -161,17 +161,17 @@ func TestStampedDeliveryFallbackKeepsItsTerm(t *testing.T) {
 func TestCheckQueueDeliveryTermRefusesOlderTerm(t *testing.T) {
 	manager, _, _ := newFencedLeader(t, "", 6)
 
-	if err := manager.CheckQueueDeliveryTerm("replication", 5); !errors.Is(err, cluster.ErrStaleLeaderDelivery) {
+	if err := manager.CheckQueueDeliveryTerm(testQueueReplication, 5); !errors.Is(err, cluster.ErrStaleLeaderDelivery) {
 		t.Fatalf("term 5 after seeing 6 must be refused as stale, got %v", err)
 	}
 	for _, term := range []uint64{6, 7} {
-		if err := manager.CheckQueueDeliveryTerm("replication", term); err != nil {
+		if err := manager.CheckQueueDeliveryTerm(testQueueReplication, term); err != nil {
 			t.Fatalf("term %d after seeing 6 must be accepted, got %v", term, err)
 		}
 	}
 
 	unfenced, _, _ := newReplicatedManualStreamNode(t, false, "")
-	if err := unfenced.CheckQueueDeliveryTerm("replication", 1); err != nil {
+	if err := unfenced.CheckQueueDeliveryTerm(testQueueReplication, 1); err != nil {
 		t.Fatalf("a node that cannot report a term must not refuse, got %v", err)
 	}
 }

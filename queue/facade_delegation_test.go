@@ -21,10 +21,10 @@ import (
 // heartbeats and queue administration are the facade's own work, not
 // transitions, and the core has no opinion about them.
 var transitionFacadeMethods = map[string]string{
-	"Ack":          "Ack",
-	"Nack":         "Nack",
-	"Reject":       "Reject",
-	"CommitOffset": "CommitOffset",
+	testMethodAck:    testMethodAck,
+	testMethodNack:   testMethodNack,
+	testMethodReject: testMethodReject,
+	"CommitOffset":   "CommitOffset",
 }
 
 // The facade must not carry queue-state logic of its own. A transition that
