@@ -10,6 +10,7 @@ import (
 
 	"github.com/absmach/fluxmq/storage"
 	"github.com/stretchr/testify/require"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // TestPruneOrphanedSubscriptions_RemovesEntryWithNoLiveOwner is the
@@ -64,4 +65,32 @@ func TestPruneOrphanedSubscriptions_RemovesEntryWithNoLiveOwner(t *testing.T) {
 func TestPruneOrphanedSubscriptions_NoSubscriptionsIsNoop(t *testing.T) {
 	c := newSingleNodeEtcdCluster(t)
 	c.pruneOrphanedSubscriptions()
+}
+
+// An entry listed as ownerless must survive when its client reconnects, or
+// re-subscribes, before the delete runs.
+func TestPruneSubscriptionEntries_KeepsEntryChangedAfterListing(t *testing.T) {
+	c := newSingleNodeEtcdCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, c.AddSubscription(ctx, "reconnected", "m/#", 1, storage.SubscribeOptions{}))
+	require.NoError(t, c.AddSubscription(ctx, "resubscribed", "m/#", 1, storage.SubscribeOptions{}))
+	require.NoError(t, c.AddSubscription(ctx, "orphaned", "m/#", 1, storage.SubscribeOptions{}))
+
+	listed, err := c.client.Get(ctx, subscriptionsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	require.NoError(t, err)
+
+	require.NoError(t, c.AcquireSession(ctx, "reconnected", c.nodeID))
+	require.NoError(t, c.AddSubscription(ctx, "resubscribed", "a/#", 1, storage.SubscribeOptions{}))
+
+	pruned, err := c.pruneSubscriptionEntries(ctx, listed.Kvs, map[string]struct{}{})
+	require.NoError(t, err)
+	require.Equal(t, 1, pruned)
+
+	for id, want := range map[string]int{"reconnected": 1, "resubscribed": 2, "orphaned": 0} {
+		subs, err := c.GetSubscriptionsForClient(ctx, id)
+		require.NoError(t, err)
+		require.Len(t, subs, want, id)
+	}
 }
